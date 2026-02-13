@@ -1,14 +1,34 @@
 ﻿import csv
+import json
 import os
 import random
 from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 import tensorflow as tf
+from PIL import Image, ImageDraw
 
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
+
+
+def configure_gpu_only() -> None:
+    """
+    Enforce GPU-only execution for this module.
+    Raises if no GPU is detected to avoid CPU fallback.
+    """
+    gpus = tf.config.list_physical_devices("GPU")
+    if not gpus:
+        raise RuntimeError(
+            "No GPU detected. GPU-only mode is enabled; CPU fallback is disabled."
+        )
+    tf.config.set_visible_devices(gpus, "GPU")
+    for gpu in gpus:
+        tf.config.experimental.set_memory_growth(gpu, True)
+
+
+configure_gpu_only()
 tf.random.set_seed(SEED)
 
 
@@ -18,18 +38,53 @@ def list_image_files(image_dir: str) -> List[str]:
     files: List[str] = []
     for ext in exts:
         files.extend(tf.io.gfile.glob(os.path.join(image_dir, ext)))
-    return sorted(files)
+
+    # Windows can match the same file across uppercase/lowercase glob patterns.
+    # Keep only unique absolute paths in a case-insensitive way.
+    unique: Dict[str, str] = {}
+    for path in files:
+        abs_path = os.path.abspath(path)
+        key = os.path.normcase(abs_path)
+        if key not in unique:
+            unique[key] = abs_path
+
+    return sorted(unique.values())
 
 
 def create_labels_template(image_dir: str, output_csv: str) -> int:
-    """Create a CSV template with columns: filename,ph."""
+    """
+    Create or update labels CSV with columns: filename,ph.
+
+    If the CSV already exists, keep previously entered pH values and only add
+    missing filenames.
+    """
     image_paths = list_image_files(image_dir)
+    existing_ph: Dict[str, str] = {}
+
+    if os.path.exists(output_csv):
+        with open(output_csv, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                filename = (row.get("filename") or "").strip()
+                ph_value = (row.get("ph") or "").strip()
+                if filename:
+                    existing_ph[filename] = ph_value
+
+    # Always update the same CSV file path in place to avoid duplicate files.
+    output_csv = os.path.abspath(output_csv)
     with open(output_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["filename", "ph"])
+        seen_filenames = set()
         for path in image_paths:
-            writer.writerow([os.path.basename(path), ""])
-    return len(image_paths)
+            filename = os.path.basename(path)
+            key = filename.lower()
+            if key in seen_filenames:
+                continue
+            seen_filenames.add(key)
+            writer.writerow([filename, existing_ph.get(filename, "")])
+
+    return len(seen_filenames)
 
 
 def preprocess_images(
@@ -37,7 +92,7 @@ def preprocess_images(
     output_dir: str,
     target_size: Tuple[int, int] = (512, 512),
 ) -> int:
-    """Resize with padding and write preprocessed PNG files."""
+    """Resize with padding and write preprocessed PNG files for DeepLab input."""
     os.makedirs(output_dir, exist_ok=True)
     image_paths = list_image_files(source_dir)
 
@@ -77,10 +132,10 @@ def get_mask_path(image_path: str, mask_dir: str) -> str:
     """Resolve the best available mask filename for an image."""
     stem = os.path.splitext(os.path.basename(image_path))[0]
     candidates = [
+        os.path.join(mask_dir, f"{stem}.json"),
+        os.path.join(mask_dir, f"{stem}_mask.json"),
         os.path.join(mask_dir, f"{stem}_mask.png"),
         os.path.join(mask_dir, f"{stem}_mask.PNG"),
-        os.path.join(mask_dir, f"{stem}.png"),
-        os.path.join(mask_dir, f"{stem}.PNG"),
     ]
 
     for candidate in candidates:
@@ -120,46 +175,61 @@ def read_image(path: tf.Tensor, image_size: Tuple[int, int]) -> tf.Tensor:
     return img
 
 
+def _read_mask_py(path, target_h, target_w):
+    path_str = path.numpy().decode("utf-8")
+    h = int(target_h.numpy())
+    w = int(target_w.numpy())
+    ext = os.path.splitext(path_str)[1].lower()
+
+    if ext == ".json":
+        with open(path_str, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        img_w = data.get("imageWidth")
+        img_h = data.get("imageHeight")
+        if not isinstance(img_w, int) or not isinstance(img_h, int):
+            raise ValueError(f"Labelme JSON missing imageWidth/imageHeight: {path_str}")
+
+        pil_mask = Image.new("L", (img_w, img_h), 0)
+        draw = ImageDraw.Draw(pil_mask)
+
+        shapes = data.get("shapes", [])
+        hydrogel_shapes = [s for s in shapes if s.get("label") == "hydrogel"]
+        draw_shapes = hydrogel_shapes if hydrogel_shapes else shapes
+
+        for shape in draw_shapes:
+            pts = shape.get("points", [])
+            if len(pts) < 3:
+                continue
+            polygon = [(float(p[0]), float(p[1])) for p in pts]
+            draw.polygon(polygon, fill=255)
+    else:
+        pil_mask = Image.open(path_str).convert("L")
+
+    pil_mask = pil_mask.resize((w, h), resample=Image.NEAREST)
+    arr = np.asarray(pil_mask, dtype=np.float32) / 255.0
+    arr = np.expand_dims(arr, axis=-1)
+    return arr
+
+
 def read_mask(path: tf.Tensor, image_size: Tuple[int, int]) -> tf.Tensor:
-    """Decode binary mask and resize with nearest interpolation."""
-    mask = tf.io.read_file(path)
-    mask = tf.io.decode_image(mask, channels=1, expand_animations=False)
-    mask.set_shape([None, None, 1])
-    mask = tf.image.convert_image_dtype(mask, tf.float32)
-    mask = tf.image.resize(mask, image_size, method="nearest")
+    """Decode binary mask from PNG/JPG or Labelme JSON and resize."""
+    target_h, target_w = image_size
+    mask = tf.py_function(
+        _read_mask_py,
+        inp=[path, target_h, target_w],
+        Tout=tf.float32,
+    )
+    mask.set_shape([target_h, target_w, 1])
     mask = tf.where(mask > 0.5, 1.0, 0.0)
     return mask
 
 
-def augment_image_and_mask(image: tf.Tensor, mask: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
-    """Apply identical geometric augmentations to image and mask."""
-    seed = tf.random.uniform([2], maxval=10000, dtype=tf.int32)
-    image = tf.image.stateless_random_flip_left_right(image, seed)
-    mask = tf.image.stateless_random_flip_left_right(mask, seed)
-
-    seed = tf.random.uniform([2], maxval=10000, dtype=tf.int32)
-    image = tf.image.stateless_random_flip_up_down(image, seed)
-    mask = tf.image.stateless_random_flip_up_down(mask, seed)
-
-    image = tf.image.random_brightness(image, 0.15)
-    image = tf.image.random_contrast(image, 0.8, 1.2)
-    image = tf.clip_by_value(image, 0.0, 1.0)
-    return image, mask
-
-
-def augment_regression_image(image: tf.Tensor) -> tf.Tensor:
-    """Photometric augmentation for regression model."""
-    image = tf.image.random_brightness(image, 0.15)
-    image = tf.image.random_contrast(image, 0.8, 1.2)
-    image = tf.image.random_saturation(image, 0.8, 1.2)
-    image = tf.clip_by_value(image, 0.0, 1.0)
-    return image
-
-
 if __name__ == "__main__":
-    src = "train"
-    dst = "train_preprocessed"
-    labels_template = "labels_template.csv"
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    src = os.path.join(base_dir, "images")
+    dst = os.path.join(base_dir, "images_preprocessed")
+    labels_template = os.path.join(base_dir, "labels_template.csv")
 
     n = preprocess_images(src, dst, target_size=(512, 512))
     print(f"Preprocessed {n} images from '{src}' to '{dst}'.")

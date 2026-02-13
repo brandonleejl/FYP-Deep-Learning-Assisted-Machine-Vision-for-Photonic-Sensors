@@ -1,6 +1,9 @@
-﻿import math
+﻿import csv
+import math
 import os
 import random
+import re
+from datetime import datetime
 from typing import List, Sequence, Tuple
 
 import numpy as np
@@ -8,10 +11,8 @@ import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
 
+from data_augmentation import augment_image_and_mask, augment_regression_image
 from data_preprocessing import (
-    augment_image_and_mask,
-    augment_regression_image,
-    get_mask_path,
     list_image_files,
     load_labels_csv,
     read_image,
@@ -22,14 +23,50 @@ from data_preprocessing import (
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
+
+
+def configure_gpu_only() -> None:
+    """
+    Enforce GPU-only execution.
+    Raises an error if no GPU is available so the run never falls back to CPU.
+    """
+    gpus = tf.config.list_physical_devices("GPU")
+    if not gpus:
+        raise RuntimeError(
+            "No GPU detected. GPU-only mode is enabled; CPU fallback is disabled. "
+            "Install CUDA/cuDNN-compatible TensorFlow GPU environment and try again."
+        )
+
+    # Restrict TensorFlow to GPU devices only.
+    tf.config.set_visible_devices(gpus, "GPU")
+    for gpu in gpus:
+        tf.config.experimental.set_memory_growth(gpu, True)
+
+    gpu_names = [gpu.name for gpu in gpus]
+    print(f"GPU-only mode enabled. Visible GPUs: {gpu_names}")
+
+
+configure_gpu_only()
 tf.random.set_seed(SEED)
 
 AUTOTUNE = tf.data.AUTOTUNE
 
 # Paths and training config
-IMAGE_DIR = "train"
-MASK_DIR = "masks"
-LABEL_CSV = "labels.csv"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+IMAGE_DIR = os.path.join(BASE_DIR, "images")
+MASK_DIR_EXTERNAL = r"C:\Users\brand\Downloads\FYP Code\masks"
+MASK_DIR_DEFAULT = os.path.join(BASE_DIR, "masks")
+MASK_DIR_ALT = os.path.join(BASE_DIR, "mask")
+if os.path.isdir(MASK_DIR_EXTERNAL):
+    MASK_DIR = MASK_DIR_EXTERNAL
+elif os.path.isdir(MASK_DIR_DEFAULT):
+    MASK_DIR = MASK_DIR_DEFAULT
+elif os.path.isdir(MASK_DIR_ALT):
+    MASK_DIR = MASK_DIR_ALT
+else:
+    MASK_DIR = IMAGE_DIR
+LABEL_CSV = os.path.join(BASE_DIR, "labels.csv")
+RESULTS_DIR = os.path.join(BASE_DIR, "results")
 
 SEG_IMAGE_SIZE = (512, 512)
 REG_IMAGE_SIZE = (224, 224)
@@ -38,6 +75,65 @@ BATCH_SIZE = 4
 SEG_EPOCHS = 40
 REG_EPOCHS = 60
 VAL_SPLIT = 0.2
+REQUIRE_JSON_MASKS = True
+
+
+def list_mask_candidates(mask_dir: str) -> List[str]:
+    """List possible mask files (JSON/PNG) from mask_dir."""
+    patterns = ["*.json", "*.JSON", "*_mask.png", "*_mask.PNG", "*.png", "*.PNG"]
+    files: List[str] = []
+    for pattern in patterns:
+        files.extend(tf.io.gfile.glob(os.path.join(mask_dir, pattern)))
+    return sorted(set(files))
+
+
+def _stem(path: str) -> str:
+    return os.path.splitext(os.path.basename(path))[0]
+
+
+def _extract_numbers(text: str) -> List[str]:
+    return re.findall(r"\d+", text)
+
+
+def resolve_mask_path_for_image(image_path: str, mask_candidates: Sequence[str]) -> str:
+    """
+    Match an image to a mask file even when filenames differ.
+    Priority:
+    1) exact stem / stem_mask
+    2) same numeric id (e.g., IMG_6042 <-> any mask containing 6042)
+    3) partial stem containment
+    """
+    image_stem = _stem(image_path).lower()
+    image_nums = _extract_numbers(image_stem)
+
+    exact = []
+    numeric = []
+    partial = []
+
+    for mask_path in mask_candidates:
+        mask_stem = _stem(mask_path).lower()
+        mask_stem_base = mask_stem[:-5] if mask_stem.endswith("_mask") else mask_stem
+
+        if mask_stem == image_stem or mask_stem_base == image_stem:
+            exact.append(mask_path)
+            continue
+
+        if image_nums:
+            mask_nums = _extract_numbers(mask_stem)
+            if any(n in mask_nums for n in image_nums):
+                numeric.append(mask_path)
+                continue
+
+        if image_stem in mask_stem or mask_stem in image_stem:
+            partial.append(mask_path)
+
+    if exact:
+        return sorted(exact)[0]
+    if numeric:
+        return sorted(numeric)[0]
+    if partial:
+        return sorted(partial)[0]
+    return ""
 
 
 def make_seg_dataset(pairs: Sequence[Tuple[str, str]], training: bool) -> tf.data.Dataset:
@@ -62,52 +158,72 @@ def make_seg_dataset(pairs: Sequence[Tuple[str, str]], training: bool) -> tf.dat
     return ds
 
 
-def conv_block(x: tf.Tensor, filters: int) -> tf.Tensor:
-    x = layers.Conv2D(filters, 3, padding="same")(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.ReLU()(x)
-    x = layers.Conv2D(filters, 3, padding="same")(x)
+def conv_bn_relu(x: tf.Tensor, filters: int, kernel_size: int, dilation_rate: int = 1) -> tf.Tensor:
+    x = layers.Conv2D(
+        filters,
+        kernel_size,
+        padding="same",
+        use_bias=False,
+        dilation_rate=dilation_rate,
+    )(x)
     x = layers.BatchNormalization()(x)
     x = layers.ReLU()(x)
     return x
 
 
-def build_unet(input_shape=(512, 512, 3)) -> keras.Model:
-    """U-Net segmentation model."""
+def build_deeplabv3plus(input_shape=(512, 512, 3)) -> keras.Model:
+    """DeepLabV3+ style segmentation model with MobileNetV2 backbone."""
     inputs = keras.Input(shape=input_shape)
 
-    c1 = conv_block(inputs, 32)
-    p1 = layers.MaxPooling2D()(c1)
+    # `weights=None` avoids runtime model download requirements.
+    backbone = tf.keras.applications.MobileNetV2(
+        input_tensor=inputs,
+        include_top=False,
+        weights=None,
+    )
 
-    c2 = conv_block(p1, 64)
-    p2 = layers.MaxPooling2D()(c2)
+    low_level = backbone.get_layer("block_3_expand_relu").output
+    high_level = backbone.get_layer("block_13_expand_relu").output
 
-    c3 = conv_block(p2, 128)
-    p3 = layers.MaxPooling2D()(c3)
+    # ASPP branch
+    b0 = conv_bn_relu(high_level, 256, 1)
+    b1 = conv_bn_relu(high_level, 256, 3, dilation_rate=6)
+    b2 = conv_bn_relu(high_level, 256, 3, dilation_rate=12)
+    b3 = conv_bn_relu(high_level, 256, 3, dilation_rate=18)
 
-    c4 = conv_block(p3, 256)
-    p4 = layers.MaxPooling2D()(c4)
+    b4 = layers.GlobalAveragePooling2D()(high_level)
+    b4 = layers.Reshape((1, 1, int(high_level.shape[-1])))(b4)
+    b4 = conv_bn_relu(b4, 256, 1)
+    b4 = layers.UpSampling2D(
+        size=(int(high_level.shape[1]), int(high_level.shape[2])),
+        interpolation="bilinear",
+    )(b4)
 
-    bn = conv_block(p4, 512)
+    x = layers.Concatenate()([b0, b1, b2, b3, b4])
+    x = conv_bn_relu(x, 256, 1)
 
-    u4 = layers.UpSampling2D()(bn)
-    u4 = layers.Concatenate()([u4, c4])
-    c5 = conv_block(u4, 256)
+    # Decoder branch
+    low_level = conv_bn_relu(low_level, 48, 1)
+    x = layers.UpSampling2D(
+        size=(
+            int(low_level.shape[1]) // int(x.shape[1]),
+            int(low_level.shape[2]) // int(x.shape[2]),
+        ),
+        interpolation="bilinear",
+    )(x)
+    x = layers.Concatenate()([x, low_level])
+    x = conv_bn_relu(x, 256, 3)
+    x = conv_bn_relu(x, 256, 3)
 
-    u3 = layers.UpSampling2D()(c5)
-    u3 = layers.Concatenate()([u3, c3])
-    c6 = conv_block(u3, 128)
-
-    u2 = layers.UpSampling2D()(c6)
-    u2 = layers.Concatenate()([u2, c2])
-    c7 = conv_block(u2, 64)
-
-    u1 = layers.UpSampling2D()(c7)
-    u1 = layers.Concatenate()([u1, c1])
-    c8 = conv_block(u1, 32)
-
-    outputs = layers.Conv2D(1, 1, activation="sigmoid")(c8)
-    return keras.Model(inputs, outputs, name="unet_segmentation")
+    x = layers.UpSampling2D(
+        size=(
+            input_shape[0] // int(x.shape[1]),
+            input_shape[1] // int(x.shape[2]),
+        ),
+        interpolation="bilinear",
+    )(x)
+    outputs = layers.Conv2D(1, 1, activation="sigmoid")(x)
+    return keras.Model(inputs, outputs, name="deeplabv3plus_segmentation")
 
 
 def dice_coef(y_true: tf.Tensor, y_pred: tf.Tensor, smooth=1e-6) -> tf.Tensor:
@@ -184,6 +300,171 @@ def r2_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return float(1.0 - (ss_res / (ss_tot + 1e-12)))
 
 
+def save_results_csv(results: dict, results_dir: str = RESULTS_DIR) -> str:
+    """Save one-row experiment metrics to timestamped CSV."""
+    os.makedirs(results_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = os.path.join(results_dir, f"{timestamp}.csv")
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(results.keys()))
+        writer.writeheader()
+        writer.writerow(results)
+    return out_path
+
+
+def save_test_predictions_csv(
+    test_image_paths: Sequence[str],
+    y_true: Sequence[float],
+    y_pred: Sequence[float],
+    summary: dict,
+    results_dir: str = RESULTS_DIR,
+) -> str:
+    """Save per-sample test predictions and global metrics to timestamped CSV."""
+    os.makedirs(results_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = os.path.join(results_dir, f"{timestamp}_test_predictions.csv")
+
+    fieldnames = [
+        "timestamp",
+        "filename",
+        "actual_ph",
+        "predicted_ph",
+        "abs_error",
+        "squared_error",
+        "mae",
+        "rmse",
+        "r2",
+    ]
+
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for path, yt, yp in zip(test_image_paths, y_true, y_pred):
+            err = float(yp - yt)
+            writer.writerow(
+                {
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                    "filename": os.path.basename(path),
+                    "actual_ph": float(yt),
+                    "predicted_ph": float(yp),
+                    "abs_error": abs(err),
+                    "squared_error": err * err,
+                    "mae": float(summary["reg_mae"]),
+                    "rmse": float(summary["reg_rmse"]),
+                    "r2": float(summary["reg_r2"]),
+                }
+            )
+    return out_path
+
+
+def save_test_predictions_excel(
+    test_image_paths: Sequence[str],
+    y_true: Sequence[float],
+    y_pred: Sequence[float],
+    summary: dict,
+    results_dir: str = RESULTS_DIR,
+) -> str:
+    """
+    Save test predictions and Excel charts.
+    Requires `xlsxwriter` package.
+    """
+    try:
+        import xlsxwriter
+    except ModuleNotFoundError:
+        print("Excel export skipped: install xlsxwriter (`pip install xlsxwriter`).")
+        return ""
+
+    os.makedirs(results_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = os.path.join(results_dir, f"{timestamp}_test_predictions.xlsx")
+
+    workbook = xlsxwriter.Workbook(out_path)
+    ws = workbook.add_worksheet("test_predictions")
+    summary_ws = workbook.add_worksheet("summary")
+
+    headers = [
+        "sample_index",
+        "filename",
+        "actual_ph",
+        "predicted_ph",
+        "residual",
+        "abs_error",
+        "squared_error",
+    ]
+
+    for col, h in enumerate(headers):
+        ws.write(0, col, h)
+
+    for i, (path, yt, yp) in enumerate(zip(test_image_paths, y_true, y_pred), start=1):
+        residual = float(yp - yt)
+        ws.write(i, 0, i)
+        ws.write(i, 1, os.path.basename(path))
+        ws.write(i, 2, float(yt))
+        ws.write(i, 3, float(yp))
+        ws.write(i, 4, residual)
+        ws.write(i, 5, abs(residual))
+        ws.write(i, 6, residual * residual)
+
+    n = len(test_image_paths)
+
+    summary_ws.write_row(0, 0, ["metric", "value"])
+    summary_ws.write_row(1, 0, ["MAE", float(summary["reg_mae"])])
+    summary_ws.write_row(2, 0, ["RMSE", float(summary["reg_rmse"])])
+    summary_ws.write_row(3, 0, ["R2", float(summary["reg_r2"])])
+
+    # Chart 1: Actual vs Predicted pH by sample index
+    chart_line = workbook.add_chart({"type": "line"})
+    chart_line.add_series(
+        {
+            "name": "Actual pH",
+            "categories": ["test_predictions", 1, 0, n, 0],
+            "values": ["test_predictions", 1, 2, n, 2],
+        }
+    )
+    chart_line.add_series(
+        {
+            "name": "Predicted pH",
+            "categories": ["test_predictions", 1, 0, n, 0],
+            "values": ["test_predictions", 1, 3, n, 3],
+        }
+    )
+    chart_line.set_title({"name": "Actual vs Predicted pH"})
+    chart_line.set_x_axis({"name": "Sample Index"})
+    chart_line.set_y_axis({"name": "pH"})
+    summary_ws.insert_chart("D2", chart_line, {"x_scale": 1.3, "y_scale": 1.2})
+
+    # Chart 2: Residual plot
+    chart_residual = workbook.add_chart({"type": "scatter", "subtype": "straight_with_markers"})
+    chart_residual.add_series(
+        {
+            "name": "Residual (Pred - Actual)",
+            "categories": ["test_predictions", 1, 0, n, 0],
+            "values": ["test_predictions", 1, 4, n, 4],
+        }
+    )
+    chart_residual.set_title({"name": "Residuals by Sample"})
+    chart_residual.set_x_axis({"name": "Sample Index"})
+    chart_residual.set_y_axis({"name": "Residual"})
+    summary_ws.insert_chart("D20", chart_residual, {"x_scale": 1.3, "y_scale": 1.2})
+
+    # Chart 3: Absolute error by sample
+    chart_error = workbook.add_chart({"type": "column"})
+    chart_error.add_series(
+        {
+            "name": "Absolute Error",
+            "categories": ["test_predictions", 1, 0, n, 0],
+            "values": ["test_predictions", 1, 5, n, 5],
+        }
+    )
+    chart_error.set_title({"name": "Absolute Error by Sample"})
+    chart_error.set_x_axis({"name": "Sample Index"})
+    chart_error.set_y_axis({"name": "Absolute Error"})
+    summary_ws.insert_chart("D38", chart_error, {"x_scale": 1.3, "y_scale": 1.2})
+
+    workbook.close()
+    return out_path
+
+
 def main() -> None:
     # 1) Collect image files.
     image_paths = list_image_files(IMAGE_DIR)
@@ -191,23 +472,42 @@ def main() -> None:
         raise RuntimeError(f"No images found in '{IMAGE_DIR}'.")
 
     # 2) Build segmentation pairs (image + mask).
+    mask_candidates = list_mask_candidates(MASK_DIR)
+    if not mask_candidates:
+        raise RuntimeError(
+            f"No mask files found in '{MASK_DIR}'. Add Labelme JSON files or mask PNG files."
+        )
+
     seg_pairs = []
     missing_masks = []
-    for path in image_paths:
-        mask_path = get_mask_path(path, MASK_DIR)
-        if tf.io.gfile.exists(mask_path):
-            seg_pairs.append((path, mask_path))
-        else:
-            missing_masks.append(mask_path)
+    non_json_matches = []
 
-    if not seg_pairs:
+    for path in image_paths:
+        mask_path = resolve_mask_path_for_image(path, mask_candidates)
+        if mask_path:
+            seg_pairs.append((path, mask_path))
+            if REQUIRE_JSON_MASKS and not mask_path.lower().endswith(".json"):
+                non_json_matches.append(os.path.basename(mask_path))
+        else:
+            stem = os.path.splitext(os.path.basename(path))[0]
+            missing_masks.append(stem)
+
+    if REQUIRE_JSON_MASKS and non_json_matches:
+        preview = ", ".join(non_json_matches[:10])
         raise RuntimeError(
-            f"No masks found in '{MASK_DIR}'. Expected names like IMG_6054_mask.png."
+            f"Matched some masks but they are not JSON in '{MASK_DIR}'. "
+            f"Count: {len(non_json_matches)}. Examples: {preview}"
+        )
+
+    if missing_masks:
+        preview = ", ".join(missing_masks[:10])
+        raise RuntimeError(
+            f"Could not match masks for all images in '{MASK_DIR}'. "
+            f"Missing count: {len(missing_masks)}. "
+            f"Image stems not matched (examples): {preview}"
         )
 
     print(f"Segmentation samples: {len(seg_pairs)}")
-    if missing_masks:
-        print(f"Warning: {len(missing_masks)} images skipped due to missing masks.")
 
     # 3) Train/val split and data pipeline for segmentation.
     seg_train, seg_val = split_train_val(seg_pairs, val_split=VAL_SPLIT)
@@ -215,7 +515,7 @@ def main() -> None:
     seg_val_ds = make_seg_dataset(seg_val, training=False)
 
     # 4) Train segmentation model.
-    seg_model = build_unet(input_shape=(SEG_IMAGE_SIZE[0], SEG_IMAGE_SIZE[1], 3))
+    seg_model = build_deeplabv3plus(input_shape=(SEG_IMAGE_SIZE[0], SEG_IMAGE_SIZE[1], 3))
     seg_model.compile(
         optimizer=keras.optimizers.Adam(1e-4),
         loss=bce_dice_loss,
@@ -231,7 +531,7 @@ def main() -> None:
         epochs=SEG_EPOCHS,
         callbacks=[
             keras.callbacks.EarlyStopping(monitor="val_loss", patience=8, restore_best_weights=True),
-            keras.callbacks.ModelCheckpoint("best_segmentation_unet.keras", save_best_only=True),
+            keras.callbacks.ModelCheckpoint("best_segmentation_deeplabv3plus.keras", save_best_only=True),
         ],
         verbose=1,
     )
@@ -303,6 +603,30 @@ def main() -> None:
     print(f"Regression MAE:  {mae:.4f}")
     print(f"Regression RMSE: {rmse:.4f}")
     print(f"Regression R^2:  {r2:.4f}")
+
+    results = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "image_dir": IMAGE_DIR,
+        "mask_dir": MASK_DIR,
+        "label_csv": LABEL_CSV,
+        "seg_model": "deeplabv3plus_segmentation",
+        "seg_loss": float(seg_eval[0]),
+        "seg_dice": float(seg_eval[1]),
+        "seg_iou": float(seg_eval[2]),
+        "reg_mae": mae,
+        "reg_rmse": rmse,
+        "reg_r2": r2,
+        "num_seg_samples": len(seg_pairs),
+        "num_reg_train": len(train_paths),
+        "num_reg_val": len(val_paths),
+    }
+    results_csv = save_results_csv(results)
+    test_results_csv = save_test_predictions_csv(val_paths, y_val, preds, results)
+    test_results_xlsx = save_test_predictions_excel(val_paths, y_val, preds, results)
+    print(f"Saved results CSV: {results_csv}")
+    print(f"Saved test predictions CSV: {test_results_csv}")
+    if test_results_xlsx:
+        print(f"Saved test predictions Excel: {test_results_xlsx}")
 
 
 if __name__ == "__main__":
