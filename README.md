@@ -154,7 +154,7 @@ python main.py
 ```
 
 GPU note:
-- `main.py`, `data_preprocessing.py`, and `data_augmentation.py` are configured for GPU-only execution.
+- `main.py` is configured for GPU-only execution.
 - If no GPU is detected, it raises an error and stops (no CPU fallback).
 
 Generated CSV outputs in `results/`:

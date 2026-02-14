@@ -3,24 +3,6 @@ from typing import Tuple
 import tensorflow as tf
 
 
-def configure_gpu_only() -> None:
-    """
-    Enforce GPU-only execution for this module.
-    Raises if no GPU is detected to avoid CPU fallback.
-    """
-    gpus = tf.config.list_physical_devices("GPU")
-    if not gpus:
-        raise RuntimeError(
-            "No GPU detected. GPU-only mode is enabled; CPU fallback is disabled."
-        )
-    tf.config.set_visible_devices(gpus, "GPU")
-    for gpu in gpus:
-        tf.config.experimental.set_memory_growth(gpu, True)
-
-
-configure_gpu_only()
-
-
 def augment_image_and_mask(image: tf.Tensor, mask: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
     """Apply identical geometric augmentations to image and mask for segmentation."""
     seed = tf.random.uniform([2], maxval=10000, dtype=tf.int32)

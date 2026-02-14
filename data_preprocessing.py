@@ -6,29 +6,10 @@ from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 import tensorflow as tf
-from PIL import Image, ImageDraw
 
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
-
-
-def configure_gpu_only() -> None:
-    """
-    Enforce GPU-only execution for this module.
-    Raises if no GPU is detected to avoid CPU fallback.
-    """
-    gpus = tf.config.list_physical_devices("GPU")
-    if not gpus:
-        raise RuntimeError(
-            "No GPU detected. GPU-only mode is enabled; CPU fallback is disabled."
-        )
-    tf.config.set_visible_devices(gpus, "GPU")
-    for gpu in gpus:
-        tf.config.experimental.set_memory_growth(gpu, True)
-
-
-configure_gpu_only()
 tf.random.set_seed(SEED)
 
 
@@ -68,7 +49,10 @@ def create_labels_template(image_dir: str, output_csv: str) -> int:
                 filename = (row.get("filename") or "").strip()
                 ph_value = (row.get("ph") or "").strip()
                 if filename:
-                    existing_ph[filename] = ph_value
+                    key = filename.lower()
+                    # Keep the first non-empty pH if duplicates exist.
+                    if key not in existing_ph or (not existing_ph[key] and ph_value):
+                        existing_ph[key] = ph_value
 
     # Always update the same CSV file path in place to avoid duplicate files.
     output_csv = os.path.abspath(output_csv)
@@ -82,7 +66,7 @@ def create_labels_template(image_dir: str, output_csv: str) -> int:
             if key in seen_filenames:
                 continue
             seen_filenames.add(key)
-            writer.writerow([filename, existing_ph.get(filename, "")])
+            writer.writerow([filename, existing_ph.get(key, "")])
 
     return len(seen_filenames)
 
@@ -176,6 +160,13 @@ def read_image(path: tf.Tensor, image_size: Tuple[int, int]) -> tf.Tensor:
 
 
 def _read_mask_py(path, target_h, target_w):
+    try:
+        from PIL import Image, ImageDraw
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "Pillow is required for mask loading. Install with: pip install pillow"
+        ) from exc
+
     path_str = path.numpy().decode("utf-8")
     h = int(target_h.numpy())
     w = int(target_w.numpy())
@@ -229,10 +220,10 @@ if __name__ == "__main__":
     base_dir = os.path.dirname(os.path.abspath(__file__))
     src = os.path.join(base_dir, "images")
     dst = os.path.join(base_dir, "images_preprocessed")
-    labels_template = os.path.join(base_dir, "labels_template.csv")
+    labels_csv = os.path.join(base_dir, "labels.csv")
 
     n = preprocess_images(src, dst, target_size=(512, 512))
     print(f"Preprocessed {n} images from '{src}' to '{dst}'.")
 
-    m = create_labels_template(src, labels_template)
-    print(f"Created '{labels_template}' with {m} rows. Fill in pH values before training.")
+    m = create_labels_template(src, labels_csv)
+    print(f"Updated '{labels_csv}' with {m} unique filenames. Fill in/update pH values as needed.")
