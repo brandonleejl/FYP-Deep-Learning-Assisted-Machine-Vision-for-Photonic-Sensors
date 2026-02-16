@@ -1,0 +1,2 @@
+timestamp,image_dir,mask_dir,label_csv,seg_model,seg_loss,seg_dice,seg_iou,reg_mae,reg_rmse,reg_r2,num_seg_samples,num_reg_train,num_reg_val
+2026-02-16T23:50:15,c:\Users\brand\Downloads\FYP Code\FYP-Deep-Learning-Assisted-Machine-Vision-for-Photonic-Sensors\images,C:\Users\brand\Downloads\FYP Code\masks,c:\Users\brand\Downloads\FYP Code\FYP-Deep-Learning-Assisted-Machine-Vision-for-Photonic-Sensors\labels.csv,deeplabv3plus_segmentation,0.7160940170288086,0.8157775402069092,0.5,0.8580605387687683,1.09120033631809,0.6509267690697338,160,128,32
