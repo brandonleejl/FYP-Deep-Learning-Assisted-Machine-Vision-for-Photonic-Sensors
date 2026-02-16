@@ -19,6 +19,7 @@ except ModuleNotFoundError:
     pd = None
 
 from data_augmentation import augment_image_and_mask, augment_regression_image
+from model_components import build_enhanced_ph_classifier
 from data_preprocessing import (
     NUM_CLASSES,
     class_idx_to_ph,
@@ -85,6 +86,9 @@ SEG_EPOCHS = 40
 CLS_EPOCHS_HEAD = 25      # train classifier head first
 CLS_EPOCHS_FINETUNE = 25  # then finetune
 VAL_SPLIT = 0.2
+
+NUM_ENSEMBLE = 3   # Number of models in the ensemble
+MC_SAMPLES = 10    # Number of Monte Carlo samples for uncertainty estimation
 
 
 # -------------------------
@@ -313,14 +317,15 @@ def resize_with_pad_np(img: np.ndarray, size: Tuple[int, int]) -> np.ndarray:
 # -------------------------
 def build_classifier_arrays(
     image_paths: Sequence[str],
-    ph_indices: Sequence[int],
+    ph_values: Sequence[float],
     seg_model: keras.Model,
     mask_threshold: float = 0.5,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
     xs: List[np.ndarray] = []
-    ys: List[np.int32] = []
+    ys_idx: List[np.int32] = []
+    ys_val: List[np.float32] = []
 
-    for path, y_idx in zip(image_paths, ph_indices):
+    for path, ph_val in zip(image_paths, ph_values):
         # Read full image at seg size for consistent mask prediction
         image_tf = read_image(tf.constant(path), SEG_IMAGE_SIZE)  # tf.Tensor
         pred_mask = seg_model.predict(tf.expand_dims(image_tf, 0), verbose=0)[0, ..., 0]
@@ -331,12 +336,16 @@ def build_classifier_arrays(
         roi = resize_with_pad_np(roi, REG_IMAGE_SIZE)
 
         xs.append(roi)
-        ys.append(np.int32(y_idx))
+        ys_idx.append(np.int32(ph_to_class_idx(ph_val)))
+        ys_val.append(np.float32(ph_val))
 
-    return np.asarray(xs, dtype=np.float32), np.asarray(ys, dtype=np.int32)
+    return np.asarray(xs, dtype=np.float32), {
+        "classification_logits": np.asarray(ys_idx, dtype=np.int32),
+        "regression_output": np.asarray(ys_val, dtype=np.float32)
+    }
 
 
-def make_cls_dataset(x: np.ndarray, y: np.ndarray, training: bool) -> tf.data.Dataset:
+def make_cls_dataset(x: np.ndarray, y: Any, training: bool) -> tf.data.Dataset:
     ds = tf.data.Dataset.from_tensor_slices((x, y))
     if training:
         ds = ds.shuffle(len(x), seed=SEED, reshuffle_each_iteration=True)
@@ -407,6 +416,7 @@ def save_predictions_csv(
     pred_ph_class: Sequence[float],
     pred_ph_expected: Sequence[float],
     confidence: Sequence[float],
+    uncertainty: Sequence[float],
     mae: float,
     rmse: float,
     r2: float,
@@ -429,6 +439,7 @@ def save_predictions_csv(
         "pred_ph_class",
         "pred_ph_expected",
         "abs_error_expected",
+        "uncertainty",
         # Legacy-compatible schema for Excel/report consumers
         "timestamp",
         "predicted_ph_expected",
@@ -444,8 +455,8 @@ def save_predictions_csv(
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
 
-        for p, yt_ph, yt_idx, yp_idx, yp_class, yp_exp, conf in zip(
-            image_paths, actual_ph, actual_idx, pred_idx, pred_ph_class, pred_ph_expected, confidence
+        for p, yt_ph, yt_idx, yp_idx, yp_class, yp_exp, conf, unc in zip(
+            image_paths, actual_ph, actual_idx, pred_idx, pred_ph_class, pred_ph_expected, confidence, uncertainty
         ):
             err = abs(float(yp_exp) - float(yt_ph))
             writer.writerow(
@@ -460,6 +471,7 @@ def save_predictions_csv(
                     "pred_ph_class": float(yp_class),
                     "pred_ph_expected": float(yp_exp),
                     "abs_error_expected": float(err),
+                    "uncertainty": float(unc),
                     "timestamp": run_timestamp,
                     "predicted_ph_expected": float(yp_exp),
                     "predicted_ph_class": float(yp_class),
@@ -764,90 +776,165 @@ def main() -> None:
         print(f"  {os.path.basename(path)} | ph_float={ph:.3f} | ph_idx={int(idx)} | decoded_ph={decoded:.3f}")
 
     # 8) Convert images to ROI arrays using seg predictions
-    x_train, y_train = build_classifier_arrays(train_imgs, y_train_idx, seg_model, mask_threshold=0.5)
-    x_val, y_val = build_classifier_arrays(val_imgs, y_val_idx, seg_model, mask_threshold=0.5)
+    x_train, y_train_dict = build_classifier_arrays(train_imgs, train_ph, seg_model, mask_threshold=0.5)
+    x_val, y_val_dict = build_classifier_arrays(val_imgs, val_ph, seg_model, mask_threshold=0.5)
 
-    cls_train_ds = make_cls_dataset(x_train, y_train, training=True)
-    cls_val_ds = make_cls_dataset(x_val, y_val, training=False)
+    cls_train_ds = make_cls_dataset(x_train, y_train_dict, training=True)
+    cls_val_ds = make_cls_dataset(x_val, y_val_dict, training=False)
 
-    # 9) Train pH classifier (head first, then fine-tune)
-    cls_model = build_ph_classifier(num_classes=NUM_CLASSES, input_shape=(REG_IMAGE_SIZE[0], REG_IMAGE_SIZE[1], 3))
+    # 9) Train Ensemble of Enhanced pH classifiers
+    ensemble_models = []
 
-    # Freeze backbone initially
-    backbone = cls_model.get_layer("mobilenetv2_1.00_224") if "mobilenetv2" in cls_model.layers[1].name.lower() else None
-    # safer: freeze all except last Dense layers
-    for layer in cls_model.layers:
-        if isinstance(layer, tf.keras.Model):
-            layer.trainable = False
+    for i in range(NUM_ENSEMBLE):
+        print(f"\nTraining Ensemble Model {i+1}/{NUM_ENSEMBLE}...")
+        cls_model = build_enhanced_ph_classifier(num_classes=NUM_CLASSES, input_shape=(REG_IMAGE_SIZE[0], REG_IMAGE_SIZE[1], 3))
 
-    cls_model.compile(
-        optimizer=keras.optimizers.Adam(3e-4),
-        loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
-        metrics=[keras.metrics.SparseCategoricalAccuracy(name="accuracy")],
-    )
+        # Compile settings for Multi-Task
+        losses = {
+            "classification_logits": keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+            "regression_output": keras.losses.MeanSquaredError()
+        }
+        loss_weights = {"classification_logits": 1.0, "regression_output": 1.0}
+        metrics = {
+            "classification_logits": keras.metrics.SparseCategoricalAccuracy(name="acc"),
+            "regression_output": keras.metrics.MeanAbsoluteError(name="mae")
+        }
 
-    cls_head_callbacks = [
-        keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3),
-    ]
-    if not args.disable_cls_early_stopping:
-        cls_head_callbacks.append(
-            keras.callbacks.EarlyStopping(
-                monitor="val_loss",
-                patience=args.cls_es_patience,
-                min_delta=args.cls_es_min_delta,
-                restore_best_weights=True,
-            )
+        # Freeze backbone initially
+        for layer in cls_model.layers:
+            if isinstance(layer, tf.keras.Model):
+                layer.trainable = False
+
+        cls_model.compile(
+            optimizer=keras.optimizers.Adam(3e-4),
+            loss=losses,
+            loss_weights=loss_weights,
+            metrics=metrics,
         )
 
-    cls_model.fit(
-        cls_train_ds,
-        validation_data=cls_val_ds,
-        epochs=CLS_EPOCHS_HEAD,
-        callbacks=cls_head_callbacks,
-        verbose=1,
-    )
-
-    # Fine-tune: unfreeze last part of MobileNetV2 if available
-    for layer in cls_model.layers:
-        if isinstance(layer, tf.keras.Model):
-            layer.trainable = True
-
-    cls_model.compile(
-        optimizer=keras.optimizers.Adam(1e-4),
-        loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
-        metrics=[keras.metrics.SparseCategoricalAccuracy(name="accuracy")],
-    )
-
-    cls_ft_callbacks = [
-        keras.callbacks.ModelCheckpoint("best_ph_classifier.keras", save_best_only=True),
-        keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3),
-    ]
-    if not args.disable_cls_early_stopping:
-        cls_ft_callbacks.append(
-            keras.callbacks.EarlyStopping(
-                monitor="val_loss",
-                patience=args.cls_es_patience,
-                min_delta=args.cls_es_min_delta,
-                restore_best_weights=True,
+        cls_head_callbacks = [
+            keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3),
+        ]
+        if not args.disable_cls_early_stopping:
+            cls_head_callbacks.append(
+                keras.callbacks.EarlyStopping(
+                    monitor="val_loss",
+                    patience=args.cls_es_patience,
+                    min_delta=args.cls_es_min_delta,
+                    restore_best_weights=True,
+                )
             )
+
+        print(f"  Head training (Model {i+1})...")
+        cls_model.fit(
+            cls_train_ds,
+            validation_data=cls_val_ds,
+            epochs=CLS_EPOCHS_HEAD,
+            callbacks=cls_head_callbacks,
+            verbose=1,
         )
 
-    cls_model.fit(
-        cls_train_ds,
-        validation_data=cls_val_ds,
-        epochs=CLS_EPOCHS_FINETUNE,
-        callbacks=cls_ft_callbacks,
-        verbose=1,
-    )
+        # Fine-tune: unfreeze last part of MobileNetV2 if available
+        for layer in cls_model.layers:
+            if isinstance(layer, tf.keras.Model):
+                layer.trainable = True
 
-    # 10) Evaluate pH with expected-value decoding from softmax(logits).
-    print("Evaluation preprocessing: deterministic only (no augmentation).")
-    logits = cls_model.predict(x_val, verbose=0)  # (N, C)
-    probs = tf.nn.softmax(logits, axis=-1).numpy()
-    pred_idx = np.argmax(probs, axis=1).astype(np.int32)
-    confidence = np.max(probs, axis=1).astype(np.float32)
+        cls_model.compile(
+            optimizer=keras.optimizers.Adam(1e-4),
+            loss=losses,
+            loss_weights=loss_weights,
+            metrics=metrics,
+        )
+
+        checkpoint_path = f"best_ph_classifier_{i}.keras"
+        cls_ft_callbacks = [
+            keras.callbacks.ModelCheckpoint(checkpoint_path, save_best_only=True, monitor="val_loss"),
+            keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3),
+        ]
+        if not args.disable_cls_early_stopping:
+            cls_ft_callbacks.append(
+                keras.callbacks.EarlyStopping(
+                    monitor="val_loss",
+                    patience=args.cls_es_patience,
+                    min_delta=args.cls_es_min_delta,
+                    restore_best_weights=True,
+                )
+            )
+
+        print(f"  Fine-tuning (Model {i+1})...")
+        cls_model.fit(
+            cls_train_ds,
+            validation_data=cls_val_ds,
+            epochs=CLS_EPOCHS_FINETUNE,
+            callbacks=cls_ft_callbacks,
+            verbose=1,
+        )
+        ensemble_models.append(checkpoint_path)
+
+    # 10) Evaluate pH with expected-value decoding from softmax(logits) + MC Dropout + Ensemble
+    print(f"Evaluation: Ensemble ({NUM_ENSEMBLE}) + MC Dropout ({MC_SAMPLES})...")
+
+    ensemble_preds_class_exp = [] # List of (N,) arrays
+    ensemble_preds_reg = []       # List of (N,) arrays
+
+    # Reconstruct filenames just in case
+    model_paths = [f"best_ph_classifier_{i}.keras" for i in range(NUM_ENSEMBLE)]
+
+    # Custom objects for loading
+    from model_components import MCDropout, cbam_block
+    custom_objs = {"MCDropout": MCDropout, "cbam_block": cbam_block}
+
+    for path in model_paths:
+        if not os.path.exists(path):
+            print(f"Warning: Model {path} not found. Skipping.")
+            continue
+
+        print(f"Loading {path}...")
+        try:
+             loaded_model = keras.models.load_model(path, custom_objects=custom_objs)
+        except Exception as e:
+             print(f"Load failed: {e}. Rebuilding and loading weights...")
+             # Rebuild
+             loaded_model = build_enhanced_ph_classifier(NUM_CLASSES, input_shape=(REG_IMAGE_SIZE[0], REG_IMAGE_SIZE[1], 3))
+             loaded_model.load_weights(path)
+
+        # MC Sampling
+        for sample_i in range(MC_SAMPLES):
+            # predict
+            preds = loaded_model.predict(x_val, verbose=0)
+            # preds is [logits, reg]
+            logits = preds[0]
+            reg_val = preds[1].flatten()
+
+            # Class expected value
+            probs = tf.nn.softmax(logits, axis=-1).numpy()
+            ph_exp = (probs * ph_values_arr[None, :]).sum(axis=1)
+
+            ensemble_preds_class_exp.append(ph_exp)
+            ensemble_preds_reg.append(reg_val)
+
+    # Stack: (Total_Samples, N_Images)
+    if not ensemble_preds_class_exp:
+         raise RuntimeError("No predictions generated!")
+
+    all_preds_class = np.vstack(ensemble_preds_class_exp) # (T, N)
+    all_preds_reg = np.vstack(ensemble_preds_reg)       # (T, N)
+
+    # Combine predictions (Class Exp + Reg) / 2
+    all_preds_combined = (all_preds_class + all_preds_reg) / 2.0
+
+    # Final Prediction = Mean over T
+    pred_ph_expected = np.mean(all_preds_combined, axis=0).astype(np.float32)
+
+    # Uncertainty = Std over T
+    uncertainty = np.std(all_preds_combined, axis=0).astype(np.float32)
+
+    # For compatibility, derive discrete class and confidence
+    pred_idx = np.array([ph_to_class_idx(p) for p in pred_ph_expected], dtype=np.int32)
     pred_ph_class = np.asarray([class_idx_to_ph(int(i)) for i in pred_idx], dtype=np.float32)
-    pred_ph_expected = (probs * ph_values_arr[None, :]).sum(axis=1).astype(np.float32)
+
+    # Confidence as exp(-uncertainty)
+    confidence = np.exp(-uncertainty).astype(np.float32)
 
     y_true_ph = np.array(val_ph, dtype=np.float32)
     y_true_idx = np.array(y_val_idx, dtype=np.int32)
@@ -856,6 +943,7 @@ def main() -> None:
     rmse = float(math.sqrt(np.mean((pred_ph_expected - y_true_ph) ** 2)))
     r2 = r2_score(y_true_ph, pred_ph_expected)
     acc_idx = float(np.mean(pred_idx == y_true_idx))
+    mean_uncertainty = float(np.mean(uncertainty))
 
     abs_err = np.abs(pred_ph_expected - y_true_ph)
     acc_01 = float(np.mean(abs_err <= 0.1))
@@ -863,9 +951,10 @@ def main() -> None:
     acc_05 = float(np.mean(abs_err <= 0.5))
 
     print(f"pH Classification Accuracy (index): {acc_idx:.4f}")
-    print(f"pH Expected-Value MAE:             {mae:.4f}")
-    print(f"pH Expected-Value RMSE:            {rmse:.4f}")
-    print(f"pH Expected-Value R^2:             {r2:.4f}")
+    print(f"pH Combined MAE:                   {mae:.4f}")
+    print(f"pH Combined RMSE:                  {rmse:.4f}")
+    print(f"pH Combined R^2:                   {r2:.4f}")
+    print(f"Mean Uncertainty (StdDev):         {mean_uncertainty:.4f}")
     print(f"Tolerance Accuracy |error|<=0.1:   {acc_01:.4f}")
     print(f"Tolerance Accuracy |error|<=0.3:   {acc_03:.4f}")
     print(f"Tolerance Accuracy |error|<=0.5:   {acc_05:.4f}")
@@ -883,7 +972,8 @@ def main() -> None:
             "Eval example:",
             f"ph_float={float(y_true_ph[0]):.3f},",
             f"pred_ph_class={float(pred_ph_class[0]):.3f},",
-            f"ph_expected={float(pred_ph_expected[0]):.3f}",
+            f"ph_expected={float(pred_ph_expected[0]):.3f},",
+            f"uncertainty={float(uncertainty[0]):.3f}"
         )
 
     # 11) Save results and report artifacts with one run timestamp
@@ -906,6 +996,7 @@ def main() -> None:
         "ph_mae": mae,
         "ph_rmse": rmse,
         "ph_r2": r2,
+        "ph_mean_uncertainty": mean_uncertainty,
         "ph_acc_tol_01": acc_01,
         "ph_acc_tol_03": acc_03,
         "ph_acc_tol_05": acc_05,
@@ -933,6 +1024,7 @@ def main() -> None:
         pred_ph_class=pred_ph_class,
         pred_ph_expected=pred_ph_expected,
         confidence=confidence,
+        uncertainty=uncertainty,
         mae=mae,
         rmse=rmse,
         r2=r2,
