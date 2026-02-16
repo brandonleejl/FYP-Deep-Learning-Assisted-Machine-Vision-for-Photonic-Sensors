@@ -406,6 +406,10 @@ def save_predictions_csv(
     pred_idx: Sequence[int],
     pred_ph_class: Sequence[float],
     pred_ph_expected: Sequence[float],
+    confidence: Sequence[float],
+    mae: float,
+    rmse: float,
+    r2: float,
     run_timestamp: str,
     results_dir: str = RESULTS_DIR,
 ) -> str:
@@ -414,6 +418,7 @@ def save_predictions_csv(
     run_date = run_timestamp.split("_")[0]
 
     fieldnames = [
+        # New schema
         "run_timestamp",
         "run_date",
         "image_path",
@@ -424,14 +429,23 @@ def save_predictions_csv(
         "pred_ph_class",
         "pred_ph_expected",
         "abs_error_expected",
+        # Legacy-compatible schema for Excel/report consumers
+        "timestamp",
+        "predicted_ph_expected",
+        "predicted_ph_class",
+        "confidence",
+        "abs_error",
+        "mae",
+        "rmse",
+        "r2",
     ]
 
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
 
-        for p, yt_ph, yt_idx, yp_idx, yp_class, yp_exp in zip(
-            image_paths, actual_ph, actual_idx, pred_idx, pred_ph_class, pred_ph_expected
+        for p, yt_ph, yt_idx, yp_idx, yp_class, yp_exp, conf in zip(
+            image_paths, actual_ph, actual_idx, pred_idx, pred_ph_class, pred_ph_expected, confidence
         ):
             err = abs(float(yp_exp) - float(yt_ph))
             writer.writerow(
@@ -446,8 +460,29 @@ def save_predictions_csv(
                     "pred_ph_class": float(yp_class),
                     "pred_ph_expected": float(yp_exp),
                     "abs_error_expected": float(err),
+                    "timestamp": run_timestamp,
+                    "predicted_ph_expected": float(yp_exp),
+                    "predicted_ph_class": float(yp_class),
+                    "confidence": float(conf),
+                    "abs_error": float(err),
+                    "mae": float(mae),
+                    "rmse": float(rmse),
+                    "r2": float(r2),
                 }
             )
+    return out_path
+
+
+def save_results_excel(csv_path: str, run_timestamp: str, results_dir: str = RESULTS_DIR) -> str:
+    """Save summary row as Excel with timestamped filename."""
+    if pd is None:
+        raise ModuleNotFoundError(
+            "Pandas is required for Excel export. Install with: pip install pandas openpyxl"
+        )
+
+    out_path = os.path.join(results_dir, f"{run_timestamp}.xlsx")
+    df = pd.read_csv(csv_path)
+    df.to_excel(out_path, index=False)
     return out_path
 
 
@@ -810,6 +845,7 @@ def main() -> None:
     logits = cls_model.predict(x_val, verbose=0)  # (N, C)
     probs = tf.nn.softmax(logits, axis=-1).numpy()
     pred_idx = np.argmax(probs, axis=1).astype(np.int32)
+    confidence = np.max(probs, axis=1).astype(np.float32)
     pred_ph_class = np.asarray([class_idx_to_ph(int(i)) for i in pred_idx], dtype=np.float32)
     pred_ph_expected = (probs * ph_values_arr[None, :]).sum(axis=1).astype(np.float32)
 
@@ -866,6 +902,7 @@ def main() -> None:
         "seg_iou": float(seg_eval[2]),
         "ph_num_classes": NUM_CLASSES,
         "ph_cls_acc_idx": acc_idx,
+        "ph_cls_acc": acc_idx,
         "ph_mae": mae,
         "ph_rmse": rmse,
         "ph_r2": r2,
@@ -876,9 +913,18 @@ def main() -> None:
         "num_eligible_ph": len(eligible),
         "num_ph_train": len(train_imgs),
         "num_ph_val": len(val_imgs),
+        # Legacy-compatible aliases for existing spreadsheets.
+        "num_total": len(image_paths_all),
+        "num_eligible": len(eligible),
     }
 
     results_csv = save_results_csv(results, run_timestamp=run_timestamp)
+    results_xlsx = ""
+    try:
+        results_xlsx = save_results_excel(results_csv, run_timestamp=run_timestamp)
+    except Exception as exc:
+        print(f"Summary Excel export skipped: {exc}")
+
     preds_csv = save_predictions_csv(
         image_paths=val_imgs,
         actual_ph=y_true_ph,
@@ -886,6 +932,10 @@ def main() -> None:
         pred_idx=pred_idx,
         pred_ph_class=pred_ph_class,
         pred_ph_expected=pred_ph_expected,
+        confidence=confidence,
+        mae=mae,
+        rmse=rmse,
+        r2=r2,
         run_timestamp=run_timestamp,
     )
 
@@ -910,6 +960,8 @@ def main() -> None:
     )
 
     print(f"Saved results CSV: {results_csv}")
+    if results_xlsx:
+        print(f"Saved results Excel: {results_xlsx}")
     print(f"Saved predictions CSV: {preds_csv}")
     if preds_xlsx:
         print(f"Saved predictions Excel: {preds_xlsx}")
