@@ -1,0 +1,7 @@
+Samples: 32
+MAE: 1.666943
+RMSE: 1.886802
+R^2: -0.043662
+Accuracy within +/-0.1: 0.0312
+Accuracy within +/-0.3: 0.1250
+Accuracy within +/-0.5: 0.1250

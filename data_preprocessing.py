@@ -12,6 +12,25 @@ random.seed(SEED)
 np.random.seed(SEED)
 tf.random.set_seed(SEED)
 
+PH_MIN = 3.0
+PH_MAX = 8.0
+PH_STEP = 0.1
+NUM_CLASSES = int(round((PH_MAX - PH_MIN) / PH_STEP)) + 1
+
+
+def ph_to_class_idx(ph: float) -> int:
+    idx = int(round((ph - PH_MIN) / PH_STEP))
+    return max(0, min(NUM_CLASSES - 1, idx))
+
+
+def class_idx_to_ph(idx: int) -> float:
+    return PH_MIN + float(idx) * PH_STEP
+
+
+def get_ph_values_tf() -> tf.Tensor:
+    """Return pH support values for expected-value decoding."""
+    return tf.linspace(PH_MIN, PH_MAX, NUM_CLASSES)
+
 
 def list_image_files(image_dir: str) -> List[str]:
     """Return sorted image files from a directory."""
@@ -159,7 +178,7 @@ def read_image(path: tf.Tensor, image_size: Tuple[int, int]) -> tf.Tensor:
     return img
 
 
-def _read_mask_py(path, target_h, target_w):
+def _read_mask_py(path, target_h, target_w, class_name):
     try:
         from PIL import Image, ImageDraw
     except ModuleNotFoundError as exc:
@@ -170,6 +189,7 @@ def _read_mask_py(path, target_h, target_w):
     path_str = path.numpy().decode("utf-8")
     h = int(target_h.numpy())
     w = int(target_w.numpy())
+    label = class_name.numpy().decode("utf-8")
     ext = os.path.splitext(path_str)[1].lower()
 
     if ext == ".json":
@@ -185,8 +205,8 @@ def _read_mask_py(path, target_h, target_w):
         draw = ImageDraw.Draw(pil_mask)
 
         shapes = data.get("shapes", [])
-        hydrogel_shapes = [s for s in shapes if s.get("label") == "hydrogel"]
-        draw_shapes = hydrogel_shapes if hydrogel_shapes else shapes
+        labeled_shapes = [s for s in shapes if s.get("label") == label]
+        draw_shapes = labeled_shapes if labeled_shapes else shapes
 
         for shape in draw_shapes:
             pts = shape.get("points", [])
@@ -203,17 +223,62 @@ def _read_mask_py(path, target_h, target_w):
     return arr
 
 
-def read_mask(path: tf.Tensor, image_size: Tuple[int, int]) -> tf.Tensor:
+def read_mask(path: tf.Tensor, image_size: Tuple[int, int], class_name: str = "hydrogel") -> tf.Tensor:
     """Decode binary mask from PNG/JPG or Labelme JSON and resize."""
     target_h, target_w = image_size
     mask = tf.py_function(
         _read_mask_py,
-        inp=[path, target_h, target_w],
+        inp=[path, target_h, target_w, tf.constant(class_name)],
         Tout=tf.float32,
     )
     mask.set_shape([target_h, target_w, 1])
     mask = tf.where(mask > 0.5, 1.0, 0.0)
     return mask
+
+
+def make_ph_dataset(
+    image_paths: Sequence[str],
+    labels: Dict[str, float],
+    image_size: Tuple[int, int],
+    batch_size: int,
+    training: bool = False,
+    augment_fn=None,
+    seed: int = SEED,
+) -> tf.data.Dataset:
+    """
+    Build pH dataset returning image, (ph_float, ph_idx_int).
+    Keeps labels.csv format unchanged (filename,ph).
+    """
+    samples = []
+    for path in image_paths:
+        filename = os.path.basename(path)
+        if filename not in labels:
+            continue
+        ph_float = float(labels[filename])
+        ph_idx = ph_to_class_idx(ph_float)
+        samples.append((path, ph_float, ph_idx))
+
+    if not samples:
+        raise ValueError("No labeled samples available to build pH dataset.")
+
+    path_arr = [s[0] for s in samples]
+    ph_float_arr = np.asarray([s[1] for s in samples], dtype=np.float32)
+    ph_idx_arr = np.asarray([s[2] for s in samples], dtype=np.int32)
+
+    ds = tf.data.Dataset.from_tensor_slices((path_arr, ph_float_arr, ph_idx_arr))
+
+    def _map_fn(path, ph_float, ph_idx):
+        image = read_image(path, image_size)
+        if training and augment_fn is not None:
+            image = augment_fn(image)
+        return image, (ph_float, tf.cast(ph_idx, tf.int32))
+
+    if training:
+        ds = ds.shuffle(len(samples), seed=seed, reshuffle_each_iteration=True)
+
+    ds = ds.map(_map_fn, num_parallel_calls=tf.data.AUTOTUNE)
+    ds = ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    return ds
 
 
 if __name__ == "__main__":
