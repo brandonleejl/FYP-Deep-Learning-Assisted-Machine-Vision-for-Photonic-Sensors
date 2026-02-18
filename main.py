@@ -7,6 +7,9 @@ import re
 from datetime import datetime
 from typing import List, Sequence, Tuple, Dict, Any
 
+# Reduce TensorFlow C++ runtime log noise (INFO/WARNING).
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+
 import numpy as np
 import tensorflow as tf
 from tensorflow import keras
@@ -686,6 +689,9 @@ def main() -> None:
     parser.add_argument("--cls-es-min-delta", type=float, default=1e-4, help="Classifier EarlyStopping min_delta.")
     args = parser.parse_args()
 
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    print(f"Results directory: {RESULTS_DIR}")
+
     configure_gpu(gpu_only=args.gpu_only)
 
     # 1) Collect images
@@ -1111,4 +1117,15 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        os.makedirs(RESULTS_DIR, exist_ok=True)
+        fail_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fail_path = os.path.join(RESULTS_DIR, f"{fail_ts}_run_error.txt")
+        with open(fail_path, "w", encoding="utf-8") as f:
+            f.write(f"Run failed at: {datetime.now().isoformat(timespec='seconds')}\n")
+            f.write(f"Error type: {type(exc).__name__}\n")
+            f.write(f"Message: {exc}\n")
+        print(f"Run failed. Wrote error log: {fail_path}")
+        raise
