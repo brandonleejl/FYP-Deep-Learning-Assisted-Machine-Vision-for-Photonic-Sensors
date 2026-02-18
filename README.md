@@ -1,8 +1,15 @@
-﻿# FYP-Deep-Learning-Assisted-Machine-Vision-for-Photonic-Sensors
+# FYP-Deep-Learning-Assisted-Machine-Vision-for-Photonic-Sensors
 
 Hydrogel image pipeline for:
 1. Segmenting hydrogel regions from UV images.
-2. Predicting continuous pH values from segmented regions.
+2. Predicting continuous pH values from segmented regions using an Enhanced Deep Learning model with Uncertainty Estimation.
+
+## New Features
+
+- **Multi-Task Learning:** Predicts both discrete pH class and continuous pH value simultaneously.
+- **Attention Mechanisms:** Uses Convolutional Block Attention Module (CBAM) for better feature extraction.
+- **Uncertainty Estimation:** Uses Monte Carlo (MC) Dropout to estimate prediction confidence.
+- **Ensemble Learning:** Trains multiple models and averages their predictions for robust results.
 
 ## Project Files and Purpose
 
@@ -14,9 +21,13 @@ What it handles: image discovery, resizing/padding, CSV label template generatio
 Purpose: Data augmentation only.
 What it handles: image+mask augmentation for segmentation and image-only augmentation for regression.
 
+- `model_components.py`
+Purpose: Model architecture definitions.
+What it handles: `MCDropout` layer, `CBAM` attention blocks, and the `build_enhanced_ph_classifier` function.
+
 - `main.py`
 Purpose: End-to-end training and evaluation script.
-What it handles: dataset construction, DeepLabV3+ segmentation training, hydrogel region extraction, pH regression training, and metrics.
+What it handles: dataset construction, DeepLabV3+ segmentation training, hydrogel region extraction, Ensemble training of pH regressors, and Uncertainty-aware metrics.
 
 ## How Files Interact With `main.py`
 
@@ -27,9 +38,13 @@ What it handles: dataset construction, DeepLabV3+ segmentation training, hydroge
 - `augment_image_and_mask`
 - `augment_regression_image`
 
-3. During training:
+3. `main.py` imports model components from `model_components.py`:
+- `build_enhanced_ph_classifier`, `MCDropout`, `cbam_block`
+
+4. During training:
 - Segmentation dataset uses `read_image` + `read_mask` + `augment_image_and_mask`.
 - Regression dataset uses masked images and applies `augment_regression_image`.
+- An ensemble of 3 models (default) is trained sequentially.
 
 ## Function-by-Function Explanation
 
@@ -78,6 +93,17 @@ Used in segmentation training.
 Applies brightness/contrast/saturation jitter to image.
 Used in regression training.
 
+### `model_components.py`
+
+- `MCDropout(rate)`
+Custom Dropout layer that is active during inference (`training=True`), enabling Monte Carlo sampling.
+
+- `cbam_block(x, ratio=8)`
+Applies Channel and Spatial Attention to the input tensor `x`.
+
+- `build_enhanced_ph_classifier(num_classes, input_shape)`
+Builds a MobileNetV2-based model with CBAM attention, MC Dropout, and dual outputs (classification logits + regression value).
+
 ### `main.py`
 
 - `make_seg_dataset(pairs, training)`
@@ -96,13 +122,10 @@ Dice overlap metric for segmentation quality.
 - `bce_dice_loss(y_true, y_pred)`
 Combines binary cross-entropy with Dice loss for stable segmentation training.
 
-- `build_regressor(input_shape=(224,224,3))`
-Builds CNN regression model that outputs one continuous pH value.
+- `build_classifier_arrays(image_paths, ph_values, seg_model, mask_threshold=0.5)`
+Runs segmentation predictions, thresholds mask, multiplies image by mask to isolate hydrogel, resizes for regression input, and returns `(X, y_dict)` arrays where `y_dict` contains both classification and regression targets.
 
-- `build_regression_arrays(image_paths, ph_values, seg_model, mask_threshold=0.5)`
-Runs segmentation predictions, thresholds mask, multiplies image by mask to isolate hydrogel, resizes for regression input, and returns `(X, y)` arrays.
-
-- `make_reg_dataset(x, y, training)`
+- `make_cls_dataset(x, y, training)`
 Builds regression `tf.data` pipeline with optional augmentation.
 
 - `r2_score(y_true, y_pred)`
@@ -115,9 +138,9 @@ End-to-end orchestration:
 3. Train/evaluate DeepLabV3+ segmentation model.
 4. Load pH labels from CSV.
 5. Build hydrogel-only regression inputs using segmentation outputs.
-6. Train/evaluate pH regression model.
-7. Save experiment metrics to `results/<YYYYMMDD_HHMMSS>.csv`.
-8. Save test/validation predictions to `results/<YYYYMMDD_HHMMSS>_test_predictions.csv`.
+6. **Ensemble Training:** Train `NUM_ENSEMBLE` (3) instances of the Enhanced pH Classifier.
+7. **Uncertainty Evaluation:** Load all ensemble models, perform `MC_SAMPLES` (10) forward passes per model per sample.
+8. Save aggregated predictions (Mean, Uncertainty) to `results/<YYYYMMDD_HHMMSS>_test_predictions.csv`.
 9. Save an Excel report with charts to `results/<YYYYMMDD_HHMMSS>_test_predictions.xlsx`.
 
 ## Expected Data Layout
@@ -130,6 +153,7 @@ project_root/
   results/                    # auto-saved training/evaluation CSV logs
   data_preprocessing.py
   data_augmentation.py
+  model_components.py
   main.py
 ```
 
@@ -141,13 +165,13 @@ project_root/
 python data_preprocessing.py
 ```
 
-2. Fill pH values in `labels_template.csv`, then save as `labels.csv`.
+2. Fill pH values in `labels_template.csv`, then save as `labels.csv` (or edit `labels.csv` directly if it exists).
 
 3. Put Labelme JSON files named like `IMG_6042.json` in `masks/`.
 If `masks/` does not exist, `main.py` will automatically read JSON masks from `images/`.
 By default, `main.py` enforces JSON annotations for every image (`REQUIRE_JSON_MASKS = True`).
 
-4. Run training:
+4. Run training and evaluation:
 
 ```bash
 python main.py
@@ -158,9 +182,9 @@ GPU note:
 - If no GPU is detected, it raises an error and stops (no CPU fallback).
 
 Generated CSV outputs in `results/`:
-- `<timestamp>.csv`: run-level summary metrics (including MAE, RMSE, R^2).
+- `<timestamp>.csv`: run-level summary metrics (including MAE, RMSE, R^2, Mean Uncertainty).
 - `<timestamp>_test_predictions.csv`: one row per test/validation sample with:
-  `filename`, `actual_ph`, `predicted_ph`, `abs_error`, `squared_error`, plus global MAE/RMSE/R^2.
+  `filename`, `actual_ph`, `predicted_ph`, `uncertainty`, `abs_error`, `squared_error`, plus global MAE/RMSE/R^2.
 - `<timestamp>_test_predictions.xlsx`: Excel report with plots:
   Actual vs Predicted pH, Residuals by sample, and Absolute Error by sample.
 
