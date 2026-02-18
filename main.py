@@ -514,10 +514,12 @@ def save_predictions_excel(csv_path: str, run_timestamp: str, results_dir: str =
 def save_report_bundle(
     actual_ph: np.ndarray,
     pred_ph_expected: np.ndarray,
+    uncertainty: np.ndarray,
     abs_err: np.ndarray,
     mae: float,
     rmse: float,
     r2: float,
+    mean_uncertainty: float,
     acc_01: float,
     acc_03: float,
     acc_05: float,
@@ -528,6 +530,11 @@ def save_report_bundle(
     os.makedirs(results_dir, exist_ok=True)
     metrics_path = os.path.join(results_dir, f"{run_timestamp}_metrics.txt")
 
+    # Define metrics summary text
+    # MAE (Mean Absolute Error): Average absolute difference between predicted and actual pH.
+    # RMSE (Root Mean Square Error): Square root of average squared differences; penalizes large errors more.
+    # R^2 (Coefficient of Determination): Proportion of variance in dependent variable predictable from independent variable.
+    # Accuracy within +/- X: Fraction of predictions where absolute error is less than or equal to X.
     metrics_text = "\n".join(
         [
             f"Run timestamp: {run_timestamp}",
@@ -535,6 +542,7 @@ def save_report_bundle(
             f"MAE: {mae:.6f}",
             f"RMSE: {rmse:.6f}",
             f"R^2: {r2:.6f}",
+            f"Mean Uncertainty (StdDev): {mean_uncertainty:.6f}",
             f"Accuracy within +/-0.1: {acc_01:.4f}",
             f"Accuracy within +/-0.3: {acc_03:.4f}",
             f"Accuracy within +/-0.5: {acc_05:.4f}",
@@ -545,19 +553,24 @@ def save_report_bundle(
 
     plt.rcParams.update({"font.size": 11})
 
-    # FIG1
+    # FIG1: Actual vs Predicted pH
+    # Shows how close predictions are to the ideal 1:1 line.
     fig, ax = plt.subplots(figsize=(6, 4))
-    ax.scatter(actual_ph, pred_ph_expected, alpha=0.8)
+    ax.scatter(actual_ph, pred_ph_expected, alpha=0.8, c='blue', label='Predictions')
     lo = float(min(np.min(actual_ph), np.min(pred_ph_expected)))
     hi = float(max(np.max(actual_ph), np.max(pred_ph_expected)))
-    ax.plot([lo, hi], [lo, hi], linestyle="--")
+    ax.plot([lo, hi], [lo, hi], linestyle="--", color='red', label='Ideal')
     ax.set_title("Actual vs Predicted pH")
     ax.set_xlabel("Actual pH")
-    ax.set_ylabel("Predicted pH (expected)")
+    ax.set_ylabel("Predicted pH")
+    ax.legend()
+
+    # Add metrics text box
+    stats_text = f"MAE: {mae:.3f}\nRMSE: {rmse:.3f}\nR^2: {r2:.3f}"
     ax.text(
-        0.03,
-        0.97,
-        f"MAE: {mae:.3f}\nRMSE: {rmse:.3f}\nR^2: {r2:.3f}",
+        0.05,
+        0.95,
+        stats_text,
         transform=ax.transAxes,
         va="top",
         bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.8},
@@ -569,11 +582,12 @@ def save_report_bundle(
     fig.savefig(fig1_pdf)
     plt.close(fig)
 
-    # FIG2
+    # FIG2: Residuals vs Actual pH
+    # Checks for bias (e.g., if model consistently overpredicts high pH).
     residual = pred_ph_expected - actual_ph
     fig, ax = plt.subplots(figsize=(6, 4))
-    ax.scatter(actual_ph, residual, alpha=0.8)
-    ax.axhline(0.0, linestyle="--")
+    ax.scatter(actual_ph, residual, alpha=0.8, c='purple')
+    ax.axhline(0.0, linestyle="--", color='black')
     ax.set_title("Residuals vs Actual pH")
     ax.set_xlabel("Actual pH")
     ax.set_ylabel("Residual (Predicted - Actual)")
@@ -584,15 +598,17 @@ def save_report_bundle(
     fig.savefig(fig2_pdf)
     plt.close(fig)
 
-    # FIG3
+    # FIG3: Histogram of Absolute Error
+    # Shows the distribution of errors.
     fig, ax = plt.subplots(figsize=(6, 4))
-    ax.hist(abs_err, bins=20)
-    ax.axvline(0.1, linestyle="--")
-    ax.axvline(0.3, linestyle="--")
-    ax.axvline(0.5, linestyle="--")
+    ax.hist(abs_err, bins=20, color='skyblue', edgecolor='black')
+    ax.axvline(0.1, linestyle="--", color='green', label='+/- 0.1')
+    ax.axvline(0.3, linestyle="--", color='orange', label='+/- 0.3')
+    ax.axvline(0.5, linestyle="--", color='red', label='+/- 0.5')
     ax.set_title("Histogram of Absolute Error")
     ax.set_xlabel("Absolute Error |Predicted - Actual|")
     ax.set_ylabel("Count")
+    ax.legend()
     fig.tight_layout()
     fig3_png = os.path.join(results_dir, f"{run_timestamp}_fig3_abs_error_hist.png")
     fig3_pdf = os.path.join(results_dir, f"{run_timestamp}_fig3_abs_error_hist.pdf")
@@ -600,15 +616,17 @@ def save_report_bundle(
     fig.savefig(fig3_pdf)
     plt.close(fig)
 
-    # FIG4
+    # FIG4: Tolerance Accuracy Curve
+    # Shows % of samples within a certain error tolerance.
     tol = np.linspace(0.0, 1.0, 101)
     acc = np.array([np.mean(abs_err <= t) for t in tol], dtype=np.float64)
     fig, ax = plt.subplots(figsize=(6, 4))
-    ax.plot(tol, acc)
+    ax.plot(tol, acc, linewidth=2, color='darkgreen')
     ax.set_title("Tolerance Accuracy Curve")
-    ax.set_xlabel("Tolerance")
-    ax.set_ylabel("Accuracy: P(|error| <= tolerance)")
-    ax.set_ylim(0.0, 1.0)
+    ax.set_xlabel("Error Tolerance (pH units)")
+    ax.set_ylabel("Accuracy (% samples within tolerance)")
+    ax.set_ylim(0.0, 1.05)
+    ax.grid(True, linestyle='--', alpha=0.7)
     fig.tight_layout()
     fig4_png = os.path.join(results_dir, f"{run_timestamp}_fig4_tolerance_curve.png")
     fig4_pdf = os.path.join(results_dir, f"{run_timestamp}_fig4_tolerance_curve.pdf")
@@ -616,16 +634,40 @@ def save_report_bundle(
     fig.savefig(fig4_pdf)
     plt.close(fig)
 
+    # FIG5: Uncertainty vs Absolute Error
+    # Validates if high uncertainty correlates with high error.
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.scatter(uncertainty, abs_err, alpha=0.7, c='coral')
+    ax.set_title("Uncertainty vs Absolute Error")
+    ax.set_xlabel("Predicted Uncertainty (Std Dev)")
+    ax.set_ylabel("Absolute Error")
+
+    # Calculate correlation
+    if len(uncertainty) > 1:
+        corr = np.corrcoef(uncertainty, abs_err)[0, 1]
+        ax.text(
+            0.05,
+            0.95,
+            f"Correlation: {corr:.3f}",
+            transform=ax.transAxes,
+            va="top",
+            bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.8},
+        )
+
+    fig.tight_layout()
+    fig5_png = os.path.join(results_dir, f"{run_timestamp}_fig5_uncertainty_vs_error.png")
+    fig5_pdf = os.path.join(results_dir, f"{run_timestamp}_fig5_uncertainty_vs_error.pdf")
+    fig.savefig(fig5_png, dpi=300)
+    fig.savefig(fig5_pdf)
+    plt.close(fig)
+
     return {
         "metrics": metrics_path,
         "fig1_png": fig1_png,
-        "fig1_pdf": fig1_pdf,
         "fig2_png": fig2_png,
-        "fig2_pdf": fig2_pdf,
         "fig3_png": fig3_png,
-        "fig3_pdf": fig3_pdf,
         "fig4_png": fig4_png,
-        "fig4_pdf": fig4_pdf,
+        "fig5_png": fig5_png,
     }
 
 
@@ -1040,10 +1082,12 @@ def main() -> None:
     report_paths = save_report_bundle(
         actual_ph=y_true_ph,
         pred_ph_expected=pred_ph_expected,
+        uncertainty=uncertainty,
         abs_err=abs_err,
         mae=mae,
         rmse=rmse,
         r2=r2,
+        mean_uncertainty=mean_uncertainty,
         acc_01=acc_01,
         acc_03=acc_03,
         acc_05=acc_05,
@@ -1062,7 +1106,8 @@ def main() -> None:
     print(f"Saved figure: {report_paths['fig2_png']}")
     print(f"Saved figure: {report_paths['fig3_png']}")
     print(f"Saved figure: {report_paths['fig4_png']}")
-    print("Saved models: best_segmentation_deeplabv3plus.keras, best_ph_classifier.keras")
+    print(f"Saved figure: {report_paths['fig5_png']}")
+    print("Saved models: best_segmentation_deeplabv3plus.keras, best_ph_classifier_*.keras")
 
 
 if __name__ == "__main__":
