@@ -913,8 +913,8 @@ def main() -> None:
         )
         ensemble_models.append(checkpoint_path)
 
-    # 10) Evaluate pH with expected-value decoding from softmax(logits) + MC Dropout + Ensemble
-    print(f"Evaluation: Ensemble ({NUM_ENSEMBLE}) + MC Dropout ({MC_SAMPLES})...")
+    # 10) Evaluate pH with expected-value decoding from softmax(logits) + MC Dropout + Ensemble + TTA
+    print(f"Evaluation: Ensemble ({NUM_ENSEMBLE}) + MC Dropout ({MC_SAMPLES}) + TTA (Horizontal Flip)...")
 
     ensemble_preds_class_exp = [] # List of (N,) arrays
     ensemble_preds_reg = []       # List of (N,) arrays
@@ -925,6 +925,9 @@ def main() -> None:
     # Custom objects for loading
     from model_components import MCDropout, cbam_block
     custom_objs = {"MCDropout": MCDropout, "cbam_block": cbam_block}
+
+    # Prepare Test-Time Augmentation (Horizontal Flip)
+    x_val_flipped = tf.image.flip_left_right(x_val).numpy()
 
     for path in model_paths:
         if not os.path.exists(path):
@@ -940,20 +943,28 @@ def main() -> None:
              loaded_model = build_enhanced_ph_classifier(NUM_CLASSES, input_shape=(REG_IMAGE_SIZE[0], REG_IMAGE_SIZE[1], 3))
              loaded_model.load_weights(path)
 
-        # MC Sampling
+        # MC Sampling with TTA
         for sample_i in range(MC_SAMPLES):
-            # predict
-            preds = loaded_model.predict(x_val, verbose=0)
-            # preds is [logits, reg]
-            logits = preds[0]
-            reg_val = preds[1].flatten()
+            # Predict Original
+            preds_orig = loaded_model.predict(x_val, verbose=0)
+            logits_orig = preds_orig[0]
+            reg_orig = preds_orig[1].flatten()
+
+            # Predict Flipped (TTA)
+            preds_flip = loaded_model.predict(x_val_flipped, verbose=0)
+            logits_flip = preds_flip[0]
+            reg_flip = preds_flip[1].flatten()
+
+            # Average Original + Flip
+            logits_avg = (logits_orig + logits_flip) / 2.0
+            reg_avg = (reg_orig + reg_flip) / 2.0
 
             # Class expected value
-            probs = tf.nn.softmax(logits, axis=-1).numpy()
+            probs = tf.nn.softmax(logits_avg, axis=-1).numpy()
             ph_exp = (probs * ph_values_arr[None, :]).sum(axis=1)
 
             ensemble_preds_class_exp.append(ph_exp)
-            ensemble_preds_reg.append(reg_val)
+            ensemble_preds_reg.append(reg_avg)
 
     # Stack: (Total_Samples, N_Images)
     if not ensemble_preds_class_exp:
@@ -992,14 +1003,20 @@ def main() -> None:
     acc_03 = float(np.mean(abs_err <= 0.3))
     acc_05 = float(np.mean(abs_err <= 0.5))
 
-    print(f"pH Classification Accuracy (index): {acc_idx:.4f}")
-    print(f"pH Combined MAE:                   {mae:.4f}")
-    print(f"pH Combined RMSE:                  {rmse:.4f}")
-    print(f"pH Combined R^2:                   {r2:.4f}")
-    print(f"Mean Uncertainty (StdDev):         {mean_uncertainty:.4f}")
-    print(f"Tolerance Accuracy |error|<=0.1:   {acc_01:.4f}")
-    print(f"Tolerance Accuracy |error|<=0.3:   {acc_03:.4f}")
-    print(f"Tolerance Accuracy |error|<=0.5:   {acc_05:.4f}")
+    # Terminal Results Summary
+    print("\n" + "="*40)
+    print("        RESULTS SUMMARY")
+    print("="*40)
+    print(f"pH Classification Accuracy:      {acc_idx:.4f}")
+    print(f"pH Combined MAE:                 {mae:.4f}")
+    print(f"pH Combined RMSE:                {rmse:.4f}")
+    print(f"pH Combined R^2:                 {r2:.4f}")
+    print(f"Mean Uncertainty (StdDev):       {mean_uncertainty:.4f}")
+    print("-" * 40)
+    print(f"Accuracy (|err| <= 0.1):         {acc_01:.4f}")
+    print(f"Accuracy (|err| <= 0.3):         {acc_03:.4f}")
+    print(f"Accuracy (|err| <= 0.5):         {acc_05:.4f}")
+    print("="*40 + "\n")
 
     # Histogram/counts to detect class collapse.
     actual_counts = np.bincount(y_true_idx, minlength=NUM_CLASSES)
