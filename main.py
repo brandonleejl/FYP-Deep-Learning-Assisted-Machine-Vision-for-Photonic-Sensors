@@ -4,6 +4,7 @@ import math
 import os
 import random
 import re
+import traceback
 from datetime import datetime
 from typing import List, Sequence, Tuple, Dict, Any
 
@@ -92,6 +93,9 @@ VAL_SPLIT = 0.2
 
 NUM_ENSEMBLE = 3   # Number of models in the ensemble
 MC_SAMPLES = 20    # Number of Monte Carlo samples for uncertainty estimation
+
+# Runtime state used for failure-safe logging/export.
+RUN_STATE: Dict[str, Any] = {}
 
 
 # -------------------------
@@ -494,6 +498,7 @@ def save_predictions_csv(
             image_paths, actual_ph, actual_idx, pred_idx, pred_ph_class, pred_ph_expected, confidence, uncertainty
         ):
             err = abs(float(yp_exp) - float(yt_ph))
+            sq_err = err ** 2
             row = {
                 "run_timestamp": run_timestamp,
                 "run_date": run_date,
@@ -505,6 +510,7 @@ def save_predictions_csv(
                 "pred_ph_class": float(yp_class),
                 "pred_ph_expected": float(yp_exp),
                 "abs_error_expected": float(err),
+                "squared_error_expected": float(sq_err),
                 "uncertainty": float(unc),
                 "timestamp": run_timestamp,
                 "predicted_ph_expected": float(yp_exp),
@@ -518,31 +524,6 @@ def save_predictions_csv(
             # Sanitize values to prevent CSV/Excel injection
             sanitized_row = {k: _sanitize_val(v) for k, v in row.items()}
             writer.writerow(sanitized_row)
-            sq_err = err ** 2
-            writer.writerow(
-                {
-                    "run_timestamp": run_timestamp,
-                    "run_date": run_date,
-                    "image_path": str(p),
-                    "filename": os.path.basename(p),
-                    "actual_ph": float(yt_ph),
-                    "actual_idx": int(yt_idx),
-                    "pred_idx": int(yp_idx),
-                    "pred_ph_class": float(yp_class),
-                    "pred_ph_expected": float(yp_exp),
-                    "abs_error_expected": float(err),
-                    "squared_error_expected": float(sq_err),
-                    "uncertainty": float(unc),
-                    "timestamp": run_timestamp,
-                    "predicted_ph_expected": float(yp_exp),
-                    "predicted_ph_class": float(yp_class),
-                    "confidence": float(conf),
-                    "abs_error": float(err),
-                    "mae": float(mae),
-                    "rmse": float(rmse),
-                    "r2": float(r2),
-                }
-            )
 
         # Append summary statistics at the bottom
         writer.writerow({})
@@ -824,10 +805,23 @@ def save_prediction_overlay(
 # MAIN
 # -------------------------
 def main() -> None:
+    global RUN_STATE
+    RUN_STATE = {}
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--gpu-only", action="store_true", help="Crash if no GPU detected.")
     parser.add_argument("--load-seg-model", type=str, default="", help="Path to pre-trained segmentation model (h5 or keras).")
     parser.add_argument("--labelme-class", default="hydrogel", help="Labelme polygon label name for hydrogel.")
+    parser.add_argument(
+        "--enable-seg-early-stopping",
+        action="store_true",
+        help="Enable segmentation EarlyStopping (disabled by default to run full epochs).",
+    )
+    parser.add_argument(
+        "--enable-cls-early-stopping",
+        action="store_true",
+        help="Enable classifier EarlyStopping (disabled by default to run full epochs).",
+    )
     parser.add_argument("--disable-seg-early-stopping", action="store_true", help="Disable segmentation EarlyStopping.")
     parser.add_argument("--disable-cls-early-stopping", action="store_true", help="Disable classifier EarlyStopping (both head and finetune).")
     parser.add_argument("--seg-es-patience", type=int, default=10, help="Segmentation EarlyStopping patience.")
@@ -835,6 +829,8 @@ def main() -> None:
     parser.add_argument("--cls-es-patience", type=int, default=8, help="Classifier EarlyStopping patience.")
     parser.add_argument("--cls-es-min-delta", type=float, default=1e-4, help="Classifier EarlyStopping min_delta.")
     args = parser.parse_args()
+    use_seg_early_stopping = args.enable_seg_early_stopping and not args.disable_seg_early_stopping
+    use_cls_early_stopping = args.enable_cls_early_stopping and not args.disable_cls_early_stopping
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
     print(f"Results directory: {RESULTS_DIR}")
@@ -893,6 +889,8 @@ def main() -> None:
 
     print(f"Total images: {len(image_paths_all)}")
     print(f"Eligible (mask + pH): {len(eligible)}")
+    RUN_STATE["num_total_images"] = len(image_paths_all)
+    RUN_STATE["num_eligible_ph"] = len(eligible)
 
     # 5) Single split (no leakage)
     # Split based on eligible images. Seg and pH training use same split.
@@ -908,6 +906,8 @@ def main() -> None:
 
     print(f"Seg train pairs: {len(seg_train_pairs)} | Seg val pairs: {len(seg_val_pairs)}")
     print(f"pH train samples: {len(train_imgs)} | pH val samples: {len(val_imgs)}")
+    RUN_STATE["num_ph_train"] = len(train_imgs)
+    RUN_STATE["num_ph_val"] = len(val_imgs)
 
     seg_train_ds = make_seg_dataset(seg_train_pairs, training=True, class_name=args.labelme_class)
     seg_val_ds = make_seg_dataset(seg_val_pairs, training=False, class_name=args.labelme_class)
@@ -937,7 +937,7 @@ def main() -> None:
             keras.callbacks.ModelCheckpoint("best_segmentation_deeplabv3plus.keras", save_best_only=True),
             keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3),
         ]
-        if not args.disable_seg_early_stopping:
+        if use_seg_early_stopping:
             seg_callbacks.append(
                 keras.callbacks.EarlyStopping(
                     monitor="val_loss",
@@ -957,6 +957,10 @@ def main() -> None:
 
         seg_eval = seg_model.evaluate(seg_val_ds, verbose=0)
         print("Segmentation eval [loss, dice, iou]:", seg_eval)
+
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    RUN_STATE["run_timestamp"] = run_timestamp
+    RUN_STATE["seg_eval"] = [float(seg_eval[0]), float(seg_eval[1]), float(seg_eval[2])]
 
     # 7) Fixed pH classes over 0.1 steps from 3.0 to 8.0
     ph_values_tf = get_ph_values_tf()
@@ -1020,7 +1024,7 @@ def main() -> None:
         cls_head_callbacks = [
             keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3),
         ]
-        if not args.disable_cls_early_stopping:
+        if use_cls_early_stopping:
             cls_head_callbacks.append(
                 keras.callbacks.EarlyStopping(
                     monitor="val_loss",
@@ -1056,7 +1060,7 @@ def main() -> None:
             keras.callbacks.ModelCheckpoint(checkpoint_path, save_best_only=True, monitor="val_loss"),
             keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3),
         ]
-        if not args.disable_cls_early_stopping:
+        if use_cls_early_stopping:
             cls_ft_callbacks.append(
                 keras.callbacks.EarlyStopping(
                     monitor="val_loss",
@@ -1154,25 +1158,30 @@ def main() -> None:
 
         # Collect first 6 for overlay
         if len(overlay_samples) < 6:
-            # Re-run segmentation to get mask for visualization
-            # We need the original image and the mask
-            img_tf = read_image(path, SEG_IMAGE_SIZE)
-            img_np = img_tf.numpy()
-            pred_mask = seg_model.predict(tf.expand_dims(img_tf, 0), verbose=0)[0, ..., 0]
+            try:
+                # Re-run segmentation to get mask for visualization.
+                img_tf = read_image(path, SEG_IMAGE_SIZE)
+                img_np = img_tf.numpy()
+                pred_mask = seg_model.predict(tf.expand_dims(img_tf, 0), verbose=0)[0, ..., 0]
 
-            overlay_samples.append({
-                "image": img_np,
-                "mask": pred_mask,
-                "true_ph": float(true_ph),
-                "pred_ph": float(pred_ph),
-                "uncertainty": float(unc),
-                "filename": filename
-            })
+                overlay_samples.append({
+                    "image": img_np,
+                    "mask": pred_mask,
+                    "true_ph": float(true_ph),
+                    "pred_ph": float(pred_ph),
+                    "uncertainty": float(unc),
+                    "filename": filename
+                })
+            except Exception as exc:
+                print(f"Warning: overlay sample skipped for {filename}: {type(exc).__name__}: {exc}")
 
     # Call save_prediction_overlay
     if overlay_samples:
-        ov_path = save_prediction_overlay(overlay_samples, run_timestamp)
-        print(f"Saved prediction overlay: {ov_path}")
+        try:
+            ov_path = save_prediction_overlay(overlay_samples, run_timestamp)
+            print(f"Saved prediction overlay: {ov_path}")
+        except Exception as exc:
+            print(f"Warning: prediction overlay export skipped: {type(exc).__name__}: {exc}")
 
     mae = float(np.mean(np.abs(pred_ph_expected - y_true_ph)))
     rmse = float(math.sqrt(np.mean((pred_ph_expected - y_true_ph) ** 2)))
@@ -1212,7 +1221,6 @@ def main() -> None:
         )
 
     # 11) Save results and report artifacts with one run timestamp
-    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     results = {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "run_timestamp": run_timestamp,
@@ -1272,21 +1280,25 @@ def main() -> None:
     except Exception as exc:
         print(f"Excel export skipped: {exc}")
 
-    report_paths = save_report_bundle(
-        actual_ph=y_true_ph,
-        pred_ph_expected=pred_ph_expected,
-        uncertainty=uncertainty,
-        abs_err=abs_err,
-        mae=mae,
-        rmse=rmse,
-        r2=r2,
-        mean_uncertainty=mean_uncertainty,
-        acc_01=acc_01,
-        acc_03=acc_03,
-        acc_05=acc_05,
-        run_timestamp=run_timestamp,
-        results_dir=RESULTS_DIR,
-    )
+    report_paths = {}
+    try:
+        report_paths = save_report_bundle(
+            actual_ph=y_true_ph,
+            pred_ph_expected=pred_ph_expected,
+            uncertainty=uncertainty,
+            abs_err=abs_err,
+            mae=mae,
+            rmse=rmse,
+            r2=r2,
+            mean_uncertainty=mean_uncertainty,
+            acc_01=acc_01,
+            acc_03=acc_03,
+            acc_05=acc_05,
+            run_timestamp=run_timestamp,
+            results_dir=RESULTS_DIR,
+        )
+    except Exception as exc:
+        print(f"Warning: report export skipped: {type(exc).__name__}: {exc}")
 
     print(f"Saved results CSV: {results_csv}")
     if results_xlsx:
@@ -1294,12 +1306,13 @@ def main() -> None:
     print(f"Saved predictions CSV: {preds_csv}")
     if preds_xlsx:
         print(f"Saved predictions Excel: {preds_xlsx}")
-    print(f"Saved metrics report: {report_paths['metrics']}")
-    print(f"Saved figure: {report_paths['fig1_png']}")
-    print(f"Saved figure: {report_paths['fig2_png']}")
-    print(f"Saved figure: {report_paths['fig3_png']}")
-    print(f"Saved figure: {report_paths['fig4_png']}")
-    print(f"Saved figure: {report_paths['fig5_png']}")
+    if report_paths:
+        print(f"Saved metrics report: {report_paths['metrics']}")
+        print(f"Saved figure: {report_paths['fig1_png']}")
+        print(f"Saved figure: {report_paths['fig2_png']}")
+        print(f"Saved figure: {report_paths['fig3_png']}")
+        print(f"Saved figure: {report_paths['fig4_png']}")
+        print(f"Saved figure: {report_paths['fig5_png']}")
     print("Saved models: best_segmentation_deeplabv3plus.keras, best_ph_classifier_*.keras")
 
 
@@ -1310,9 +1323,40 @@ if __name__ == "__main__":
         os.makedirs(RESULTS_DIR, exist_ok=True)
         fail_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         fail_path = os.path.join(RESULTS_DIR, f"{fail_ts}_run_error.txt")
+        fail_run_ts = str(RUN_STATE.get("run_timestamp") or fail_ts)
+
+        # Best-effort partial summary export so every failed run still creates a CSV artifact.
+        try:
+            seg_eval_state = RUN_STATE.get("seg_eval", [float("nan"), float("nan"), float("nan")])
+            partial_results = {
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "run_timestamp": fail_run_ts,
+                "run_date": fail_run_ts.split("_")[0],
+                "status": "failed",
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+                "image_dir": IMAGE_DIR,
+                "mask_dir": MASK_DIR,
+                "label_csv": LABEL_CSV,
+                "seg_model": "deeplabv3plus_segmentation",
+                "seg_loss": float(seg_eval_state[0]),
+                "seg_dice": float(seg_eval_state[1]),
+                "seg_iou": float(seg_eval_state[2]),
+                "num_total_images": int(RUN_STATE.get("num_total_images", 0)),
+                "num_eligible_ph": int(RUN_STATE.get("num_eligible_ph", 0)),
+                "num_ph_train": int(RUN_STATE.get("num_ph_train", 0)),
+                "num_ph_val": int(RUN_STATE.get("num_ph_val", 0)),
+            }
+            partial_csv = save_results_csv(partial_results, run_timestamp=fail_run_ts)
+            print(f"Saved partial results CSV (failed run): {partial_csv}")
+        except Exception as save_exc:
+            print(f"Warning: failed to write partial results CSV: {type(save_exc).__name__}: {save_exc}")
+
         with open(fail_path, "w", encoding="utf-8") as f:
             f.write(f"Run failed at: {datetime.now().isoformat(timespec='seconds')}\n")
             f.write(f"Error type: {type(exc).__name__}\n")
             f.write(f"Message: {exc}\n")
+            f.write("Traceback:\n")
+            f.write(traceback.format_exc())
         print(f"Run failed. Wrote error log: {fail_path}")
         raise
