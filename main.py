@@ -401,13 +401,44 @@ def r2_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 # -------------------------
 # Save results
 # -------------------------
+def _sanitize_val(val):
+    """
+    Prefixes string values starting with formula-triggering characters with a single quote.
+    Trigger characters include: =, +, -, @, \t, \r
+    """
+    if isinstance(val, str) and val and val[0] in ("=", "+", "-", "@", "\t", "\r"):
+        return f"'{val}"
+    return val
+
+
+def _sanitize_for_excel(df):
+    """
+    Sanitize a pandas DataFrame to prevent Excel Injection.
+    Prefixes cells starting with formula-triggering characters with a single quote.
+    """
+    if df is None:
+        return None
+
+    # Create a copy to avoid modifying the original dataframe
+    df_safe = df.copy()
+
+    # Apply sanitization to all object (string) columns
+    for col in df_safe.columns:
+        if df_safe[col].dtype == "object":
+            df_safe[col] = df_safe[col].apply(_sanitize_val)
+
+    return df_safe
+
+
 def save_results_csv(results: dict, run_timestamp: str, results_dir: str = RESULTS_DIR) -> str:
     os.makedirs(results_dir, exist_ok=True)
     out_path = os.path.join(results_dir, f"{run_timestamp}.csv")
     with open(out_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(results.keys()))
+        # Sanitize values to prevent CSV/Excel injection
+        sanitized_results = {k: _sanitize_val(v) for k, v in results.items()}
+        writer = csv.DictWriter(f, fieldnames=list(sanitized_results.keys()))
         writer.writeheader()
-        writer.writerow(results)
+        writer.writerow(sanitized_results)
     return out_path
 
 
@@ -463,6 +494,30 @@ def save_predictions_csv(
             image_paths, actual_ph, actual_idx, pred_idx, pred_ph_class, pred_ph_expected, confidence, uncertainty
         ):
             err = abs(float(yp_exp) - float(yt_ph))
+            row = {
+                "run_timestamp": run_timestamp,
+                "run_date": run_date,
+                "image_path": str(p),
+                "filename": os.path.basename(p),
+                "actual_ph": float(yt_ph),
+                "actual_idx": int(yt_idx),
+                "pred_idx": int(yp_idx),
+                "pred_ph_class": float(yp_class),
+                "pred_ph_expected": float(yp_exp),
+                "abs_error_expected": float(err),
+                "uncertainty": float(unc),
+                "timestamp": run_timestamp,
+                "predicted_ph_expected": float(yp_exp),
+                "predicted_ph_class": float(yp_class),
+                "confidence": float(conf),
+                "abs_error": float(err),
+                "mae": float(mae),
+                "rmse": float(rmse),
+                "r2": float(r2),
+            }
+            # Sanitize values to prevent CSV/Excel injection
+            sanitized_row = {k: _sanitize_val(v) for k, v in row.items()}
+            writer.writerow(sanitized_row)
             sq_err = err ** 2
             writer.writerow(
                 {
@@ -507,6 +562,7 @@ def save_results_excel(csv_path: str, run_timestamp: str, results_dir: str = RES
 
     out_path = os.path.join(results_dir, f"{run_timestamp}.xlsx")
     df = pd.read_csv(csv_path)
+    df = _sanitize_for_excel(df)
     df.to_excel(out_path, index=False)
     return out_path
 
@@ -520,6 +576,7 @@ def save_predictions_excel(csv_path: str, run_timestamp: str, results_dir: str =
 
     out_path = os.path.join(results_dir, f"{run_timestamp}_predictions.xlsx")
     df = pd.read_csv(csv_path)
+    df = _sanitize_for_excel(df)
     df.to_excel(out_path, index=False)
     return out_path
 
