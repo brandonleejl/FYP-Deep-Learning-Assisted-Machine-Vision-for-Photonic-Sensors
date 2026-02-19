@@ -98,19 +98,38 @@ def preprocess_images(
     """Resize with padding and write preprocessed PNG files for DeepLab input."""
     os.makedirs(output_dir, exist_ok=True)
     image_paths = list_image_files(source_dir)
+    if not image_paths:
+        return 0
 
-    for path in image_paths:
-        img_bytes = tf.io.read_file(path)
+    # Create a list of output paths corresponding to image paths
+    out_paths = [os.path.join(output_dir, os.path.basename(p)) for p in image_paths]
+
+    # Use tf.data.Dataset for parallel processing
+    ds = tf.data.Dataset.from_tensor_slices((image_paths, out_paths))
+
+    def _process_image(image_path: tf.Tensor, out_path: tf.Tensor) -> tf.Tensor:
+        img_bytes = tf.io.read_file(image_path)
         img = tf.io.decode_image(img_bytes, channels=3, expand_animations=False)
         img.set_shape([None, None, 3])
         img = tf.image.convert_image_dtype(img, tf.float32)  # [0, 1]
         img = tf.image.resize_with_pad(img, target_size[0], target_size[1])
 
-        out_path = os.path.join(output_dir, os.path.basename(path))
+        # Encode to PNG and save to disk
         png = tf.image.encode_png(tf.cast(img * 255.0, tf.uint8))
         tf.io.write_file(out_path, png)
+        return image_path
 
-    return len(image_paths)
+    # Parallelize the map with AUTOTUNE
+    ds = ds.map(_process_image, num_parallel_calls=tf.data.AUTOTUNE)
+    # Prefetch for better performance
+    ds = ds.prefetch(tf.data.AUTOTUNE)
+
+    # Iterate through the dataset to trigger processing
+    count = 0
+    for _ in ds:
+        count += 1
+
+    return count
 
 
 def load_labels_csv(label_csv: str) -> Dict[str, float]:
