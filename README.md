@@ -1,5 +1,8 @@
 # FYP-Deep-Learning-Assisted-Machine-Vision-for-Photonic-Sensors
 
+conda activate fyp_gpu
+
+
 Hydrogel image pipeline for:
 1. Segmenting hydrogel regions from UV images.
 2. Predicting continuous pH values from segmented regions using an Enhanced Deep Learning model with Uncertainty Estimation.
