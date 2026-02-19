@@ -91,7 +91,7 @@ CLS_EPOCHS_FINETUNE = 25  # then finetune
 VAL_SPLIT = 0.2
 
 NUM_ENSEMBLE = 3   # Number of models in the ensemble
-MC_SAMPLES = 10    # Number of Monte Carlo samples for uncertainty estimation
+MC_SAMPLES = 20    # Number of Monte Carlo samples for uncertainty estimation
 
 
 # -------------------------
@@ -473,6 +473,7 @@ def save_predictions_csv(
         "pred_ph_class",
         "pred_ph_expected",
         "abs_error_expected",
+        "squared_error_expected",
         "uncertainty",
         # Legacy-compatible schema for Excel/report consumers
         "timestamp",
@@ -517,6 +518,38 @@ def save_predictions_csv(
             # Sanitize values to prevent CSV/Excel injection
             sanitized_row = {k: _sanitize_val(v) for k, v in row.items()}
             writer.writerow(sanitized_row)
+            sq_err = err ** 2
+            writer.writerow(
+                {
+                    "run_timestamp": run_timestamp,
+                    "run_date": run_date,
+                    "image_path": str(p),
+                    "filename": os.path.basename(p),
+                    "actual_ph": float(yt_ph),
+                    "actual_idx": int(yt_idx),
+                    "pred_idx": int(yp_idx),
+                    "pred_ph_class": float(yp_class),
+                    "pred_ph_expected": float(yp_exp),
+                    "abs_error_expected": float(err),
+                    "squared_error_expected": float(sq_err),
+                    "uncertainty": float(unc),
+                    "timestamp": run_timestamp,
+                    "predicted_ph_expected": float(yp_exp),
+                    "predicted_ph_class": float(yp_class),
+                    "confidence": float(conf),
+                    "abs_error": float(err),
+                    "mae": float(mae),
+                    "rmse": float(rmse),
+                    "r2": float(r2),
+                }
+            )
+
+        # Append summary statistics at the bottom
+        writer.writerow({})
+        writer.writerow({"filename": "OVERALL MAE", "pred_ph_expected": mae})
+        writer.writerow({"filename": "OVERALL RMSE", "pred_ph_expected": rmse})
+        writer.writerow({"filename": "OVERALL R2", "pred_ph_expected": r2})
+
     return out_path
 
 
@@ -708,12 +741,92 @@ def save_report_bundle(
     }
 
 
+def save_prediction_overlay(
+    samples: List[Dict[str, Any]],
+    run_timestamp: str,
+    results_dir: str = RESULTS_DIR
+) -> str:
+    """
+    Generates a visual grid of test images with overlays showing actual pH, predicted pH, and uncertainty.
+
+    samples: List of dicts with keys:
+             'image' (np array, HxWx3, [0..1]),
+             'mask' (np array, HxWx1 or HxW, [0..1]),
+             'true_ph' (float),
+             'pred_ph' (float),
+             'uncertainty' (float),
+             'filename' (str)
+    """
+    if not samples:
+        return ""
+
+    os.makedirs(results_dir, exist_ok=True)
+    num_samples = len(samples)
+
+    # Grid layout: e.g. 3 columns
+    cols = 3
+    rows = (num_samples + cols - 1) // cols
+
+    fig, axes = plt.subplots(rows, cols, figsize=(15, 5 * rows))
+    # Ensure axes is always iterable (flattened array)
+    if isinstance(axes, np.ndarray):
+        axes = axes.flatten()
+    else:
+        axes = [axes]
+
+    for i, ax in enumerate(axes):
+        if i < num_samples:
+            sample = samples[i]
+            img = sample['image']
+            mask = sample['mask']
+
+            # Ensure mask is squeezed for overlay
+            if mask.ndim == 3:
+                mask = mask[:, :, 0]
+
+            ax.imshow(img)
+
+            # Overlay mask: where mask > 0.5, draw semi-transparent red
+            # Masked array where condition is False (so we mask out the background which is < 0.5)
+            # Actually, np.ma.masked_where(condition, array) masks where condition is TRUE.
+            # We want to show the mask where mask > 0.5.
+            # So we mask where mask <= 0.5.
+            masked_region = np.ma.masked_where(mask <= 0.5, mask)
+            ax.imshow(masked_region, cmap='autumn', alpha=0.3, vmin=0, vmax=1)
+
+            text_str = (
+                f"File: {sample['filename']}\n"
+                f"True: {sample['true_ph']:.2f}\n"
+                f"Pred: {sample['pred_ph']:.2f}\n"
+                f"Unc: {sample['uncertainty']:.4f}"
+            )
+
+            ax.text(
+                0.05, 0.95, text_str,
+                transform=ax.transAxes,
+                fontsize=10,
+                verticalalignment='top',
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8)
+            )
+            ax.set_title(sample['filename'], fontsize=9)
+            ax.axis('off')
+        else:
+            ax.axis('off')
+
+    plt.tight_layout()
+    out_path = os.path.join(results_dir, f"{run_timestamp}_prediction_overlay.png")
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
 # -------------------------
 # MAIN
 # -------------------------
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--gpu-only", action="store_true", help="Crash if no GPU detected.")
+    parser.add_argument("--load-seg-model", type=str, default="", help="Path to pre-trained segmentation model (h5 or keras).")
     parser.add_argument("--labelme-class", default="hydrogel", help="Labelme polygon label name for hydrogel.")
     parser.add_argument("--disable-seg-early-stopping", action="store_true", help="Disable segmentation EarlyStopping.")
     parser.add_argument("--disable-cls-early-stopping", action="store_true", help="Disable classifier EarlyStopping (both head and finetune).")
@@ -799,41 +912,51 @@ def main() -> None:
     seg_train_ds = make_seg_dataset(seg_train_pairs, training=True, class_name=args.labelme_class)
     seg_val_ds = make_seg_dataset(seg_val_pairs, training=False, class_name=args.labelme_class)
 
-    # 6) Train segmentation model
-    seg_model = build_deeplabv3plus(input_shape=(SEG_IMAGE_SIZE[0], SEG_IMAGE_SIZE[1], 3))
-    seg_model.compile(
-        optimizer=keras.optimizers.Adam(1e-4),
-        loss=bce_dice_loss,
-        metrics=[
-            dice_coef,
-            keras.metrics.BinaryIoU(target_class_ids=[1], threshold=0.5),
-        ],
-    )
+    # 6) Train or Load segmentation model
+    if args.load_seg_model and os.path.exists(args.load_seg_model):
+        print(f"Loading pre-trained segmentation model from: {args.load_seg_model}")
+        custom_objects = {"bce_dice_loss": bce_dice_loss, "dice_coef": dice_coef}
+        seg_model = keras.models.load_model(args.load_seg_model, custom_objects=custom_objects)
+        seg_eval = seg_model.evaluate(seg_val_ds, verbose=0)
+        print("Loaded Segmentation eval [loss, dice, iou]:", seg_eval)
+    else:
+        if args.load_seg_model:
+            print(f"Warning: Model path {args.load_seg_model} not found. Training from scratch.")
 
-    seg_callbacks = [
-        keras.callbacks.ModelCheckpoint("best_segmentation_deeplabv3plus.keras", save_best_only=True),
-        keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3),
-    ]
-    if not args.disable_seg_early_stopping:
-        seg_callbacks.append(
-            keras.callbacks.EarlyStopping(
-                monitor="val_loss",
-                patience=args.seg_es_patience,
-                min_delta=args.seg_es_min_delta,
-                restore_best_weights=True,
-            )
+        seg_model = build_deeplabv3plus(input_shape=(SEG_IMAGE_SIZE[0], SEG_IMAGE_SIZE[1], 3))
+        seg_model.compile(
+            optimizer=keras.optimizers.Adam(1e-4),
+            loss=bce_dice_loss,
+            metrics=[
+                dice_coef,
+                keras.metrics.BinaryIoU(target_class_ids=[1], threshold=0.5),
+            ],
         )
 
-    seg_model.fit(
-        seg_train_ds,
-        validation_data=seg_val_ds,
-        epochs=SEG_EPOCHS,
-        callbacks=seg_callbacks,
-        verbose=1,
-    )
+        seg_callbacks = [
+            keras.callbacks.ModelCheckpoint("best_segmentation_deeplabv3plus.keras", save_best_only=True),
+            keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3),
+        ]
+        if not args.disable_seg_early_stopping:
+            seg_callbacks.append(
+                keras.callbacks.EarlyStopping(
+                    monitor="val_loss",
+                    patience=args.seg_es_patience,
+                    min_delta=args.seg_es_min_delta,
+                    restore_best_weights=True,
+                )
+            )
 
-    seg_eval = seg_model.evaluate(seg_val_ds, verbose=0)
-    print("Segmentation eval [loss, dice, iou]:", seg_eval)
+        seg_model.fit(
+            seg_train_ds,
+            validation_data=seg_val_ds,
+            epochs=SEG_EPOCHS,
+            callbacks=seg_callbacks,
+            verbose=1,
+        )
+
+        seg_eval = seg_model.evaluate(seg_val_ds, verbose=0)
+        print("Segmentation eval [loss, dice, iou]:", seg_eval)
 
     # 7) Fixed pH classes over 0.1 steps from 3.0 to 8.0
     ph_values_tf = get_ph_values_tf()
@@ -1020,6 +1143,36 @@ def main() -> None:
 
     y_true_ph = np.array(val_ph, dtype=np.float32)
     y_true_idx = np.array(y_val_idx, dtype=np.int32)
+
+    # Print real-time progress for each test image
+    print("\n--- Inference Results ---")
+    overlay_samples = []
+
+    for i, (path, true_ph, pred_ph, unc) in enumerate(zip(val_imgs, y_true_ph, pred_ph_expected, uncertainty)):
+        filename = os.path.basename(path)
+        print(f"[{i+1}/{len(val_imgs)}] {filename} | True: {true_ph:.2f} | Pred: {pred_ph:.2f} | Unc: {unc:.4f}")
+
+        # Collect first 6 for overlay
+        if len(overlay_samples) < 6:
+            # Re-run segmentation to get mask for visualization
+            # We need the original image and the mask
+            img_tf = read_image(path, SEG_IMAGE_SIZE)
+            img_np = img_tf.numpy()
+            pred_mask = seg_model.predict(tf.expand_dims(img_tf, 0), verbose=0)[0, ..., 0]
+
+            overlay_samples.append({
+                "image": img_np,
+                "mask": pred_mask,
+                "true_ph": float(true_ph),
+                "pred_ph": float(pred_ph),
+                "uncertainty": float(unc),
+                "filename": filename
+            })
+
+    # Call save_prediction_overlay
+    if overlay_samples:
+        ov_path = save_prediction_overlay(overlay_samples, run_timestamp)
+        print(f"Saved prediction overlay: {ov_path}")
 
     mae = float(np.mean(np.abs(pred_ph_expected - y_true_ph)))
     rmse = float(math.sqrt(np.mean((pred_ph_expected - y_true_ph) ** 2)))
