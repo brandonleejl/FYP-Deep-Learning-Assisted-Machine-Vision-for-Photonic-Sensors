@@ -1,0 +1,14 @@
+Run failed at: 2026-02-21T04:26:38
+Error type: OSError
+Message: [Errno 22] Invalid argument
+Traceback:
+Traceback (most recent call last):
+  File "C:\Users\brand\Downloads\FYP Code\FYP-Deep-Learning-Assisted-Machine-Vision-for-Photonic-Sensors\main.py", line 1321, in <module>
+    main()
+  File "C:\Users\brand\Downloads\FYP Code\FYP-Deep-Learning-Assisted-Machine-Vision-for-Photonic-Sensors\main.py", line 950, in main
+    seg_model.fit(
+  File "C:\Users\brand\Downloads\Anaconda\lib\site-packages\keras\src\utils\traceback_utils.py", line 122, in error_handler
+    raise e.with_traceback(filtered_tb) from None
+  File "C:\Users\brand\Downloads\Anaconda\lib\site-packages\keras\src\utils\io_utils.py", line 111, in print_msg
+    sys.stdout.flush()
+OSError: [Errno 22] Invalid argument

@@ -36,8 +36,8 @@ def install_dependencies():
     check_python_version()
 
     packages = [
-        "tensorflow",   # Core ML library
-        "numpy",        # Numerical computing
+        "tensorflow==2.20.0",   # Core ML library (NumPy 2 compatible build)
+        "numpy<2",            # Keep 1.x ABI compatibility for older compiled wheels
         "matplotlib",   # Plotting and visualization
         "pandas",       # Data manipulation (for CSV/Excel handling)
         "openpyxl",     # Excel export support
@@ -62,3 +62,4 @@ def install_dependencies():
 
 if __name__ == "__main__":
     install_dependencies()
+
